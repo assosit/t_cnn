@@ -1,5 +1,6 @@
 import argparse
 import copy
+import json
 from pathlib import Path
 
 import numpy as np
@@ -17,17 +18,22 @@ from util.misc import get_param_dict
 
 # ==============================================================
 # (1) 修正: backgroundなし、上端・下端の2クラスのみ
-# 旧: COCO_CLASSES = ['__background__', 'person', ...]
+# 旧: CLASSES = ['top', 'bottom']  # list、0始まり
+# 新: CLASSES = {1: 'top', 2: 'bottom'}  # dict、1始まり（GT category_idに合わせる）
 # ==============================================================
-CLASSES = ['top', 'bottom']  # index 0=上端, 1=下端
-CLASS_COLORS = ['red', 'blue']  # 描画色（クラスごとに区別）
+CLASSES = {1: 'top', 2: 'bottom'}
+# ==============================================================
+# (1) 修正: CLASS_COLORSもdictに変更
+# 旧: CLASS_COLORS = ['red', 'blue']
+# 新: CLASS_COLORS = {1: 'red', 2: 'blue'}
+# ==============================================================
+CLASS_COLORS = {1: 'red', 2: 'blue'}
 
 # top-Kの数
 TOP_K = 5  # (2) 各クラスtop-5を取得
 
 
 def get_args_parser():
-    # --- 変更なし（省略せずそのまま残す） ---
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--weights', type=str, default=None, required=True)
     parser.add_argument('--device', default='cuda')
@@ -78,12 +84,19 @@ def get_args_parser():
     parser.add_argument('--input', default=None, required=True)
     parser.add_argument('--output_dir', default='output')
     parser.add_argument('--confidence_threshold', type=float, default=0.5)
+    # ==============================================================
+    # (2) 追加: GT読み込み用データセットフォルダパス
+    # 旧: なし
+    # 新: --dataset_dir でCOCO形式データセットのルートを指定
+    # ==============================================================
+    parser.add_argument('--dataset_dir', default=None,
+                        help='Path to dataset root directory for loading GT annotations.')
     return parser
 
 
 def preprocess_image(image_path):
     image = Image.open(image_path).convert("RGB")
-    # orig_image_size = torch.tensor(image.size[::-1])
+    orig_image_size = torch.tensor(image.size[::-1])
     normalize = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
@@ -93,17 +106,70 @@ def preprocess_image(image_path):
         normalize,
     ])
     image = transform(image)
-    # 64の倍数でパディングする処理後の画像サイズを求めてorig_image_sizeとする
-    # imageはパディングしなくて良い(モデル入力後にパディングするため)
-
-
     return image, orig_image_size
 
 
 # ==============================================================
-# (2) 修正: クラス別top-Kのbboxを取得する関数
-# 旧: postprocessors['bbox']がflatten top-100を返していた
-# 新: クラスごとに独立してtop-K件を取得
+# (2) 追加: COCOアノテーションから対象画像のGT情報を読み込む関数
+# ==============================================================
+def load_gt_for_image(dataset_dir, image_path):
+    """
+    指定した画像ファイルに対応するGT bbox情報を
+    COCOアノテーションファイルから読み込む。
+
+    Args:
+        dataset_dir: データセットのルートフォルダパス
+                     （annotations/*.jsonが存在するフォルダ）
+        image_path:  可視化対象の画像ファイルパス
+
+    Returns:
+        gt_info: list of dict
+            [{'category_id': int, 'bbox': [x_min, y_min, w, h]}, ...]
+            bbox はCOCO形式（x_min, y_min, width, height）絶対座標
+    """
+    dataset_dir = Path(dataset_dir)
+    image_filename = Path(image_path).name
+
+    # annotationsフォルダ内の全jsonを検索
+    ann_candidates = list(dataset_dir.glob('annotations/*.json'))
+    if not ann_candidates:
+        raise FileNotFoundError(f"annotations/*.json が見つかりません: {dataset_dir}")
+
+    # 対象画像が含まれるアノテーションファイルを特定
+    ann_data = None
+    target_image_info = None
+    for ann_path in ann_candidates:
+        with open(ann_path, 'r') as f:
+            data = json.load(f)
+        matched = [img for img in data['images']
+                   if Path(img['file_name']).name == image_filename]
+        if matched:
+            ann_data = data
+            target_image_info = matched[0]
+            break
+
+    if ann_data is None:
+        raise ValueError(f"{image_filename} はいずれのアノテーションファイルにも見つかりません。")
+
+    image_id = target_image_info['id']
+
+    # 該当image_idのannotationを抽出
+    gt_info = [
+        {
+            'category_id': ann['category_id'],  # 1始まり
+            'bbox': ann['bbox'],                 # [x_min, y_min, w, h]
+        }
+        for ann in ann_data['annotations']
+        if ann['image_id'] == image_id
+    ]
+
+    return gt_info
+
+
+# ==============================================================
+# (1)(2) 修正: クラス別top-Kのbboxを取得する関数
+# 旧: result_per_class のキーが c（0始まり）
+# 新: result_per_class のキーが c+1（1始まり、GT category_idに対応）
 # ==============================================================
 def get_topk_per_class(outputs, orig_image_sizes, k=TOP_K):
     """
@@ -112,9 +178,10 @@ def get_topk_per_class(outputs, orig_image_sizes, k=TOP_K):
     Returns:
         result_per_class: dict
             {
-              class_id(int): {
-                'scores': [k],   降順ソート済み
-                'boxes':  [k,4], x1y1x2y2・絶対座標
+              category_id(int, 1始まり): {
+                'scores':    Tensor [K],   降順ソート済み
+                'boxes':     Tensor [K,4], x1y1x2y2・絶対座標
+                'query_idx': Tensor [K],   対応するクエリインデックス
               }
             }
     """
@@ -134,49 +201,102 @@ def get_topk_per_class(outputs, orig_image_sizes, k=TOP_K):
     result_per_class = {}
     for c in range(C):
         topk_k = min(k, Q)
-        # クラスcのスコアで降順top-K
         topk_scores, topk_idx = torch.topk(prob[b, :, c], topk_k)
 
-        boxes = out_bbox[b, topk_idx]              # [K, 4]  cx,cy,w,h
-        boxes = box_cxcywh_to_xyxy(boxes)          # [K, 4]  x1,y1,x2,y2
-        boxes = boxes * scale[None, :]             # 絶対座標に変換
+        boxes = out_bbox[b, topk_idx]
+        boxes = box_cxcywh_to_xyxy(boxes)
+        boxes = boxes * scale[None, :]
 
-        result_per_class[c] = {
-            'scores': topk_scores.cpu(),
-            'boxes':  boxes.cpu(),
+        # ==============================================================
+        # (1) 修正: キーをc（0始まり）からc+1（1始まり）に変更
+        # 旧: result_per_class[c] = ...
+        # 新: result_per_class[c + 1] = ...
+        # ==============================================================
+        category_id = c + 1
+        result_per_class[category_id] = {
+            'scores':    topk_scores.cpu(),
+            'boxes':     boxes.cpu(),
+            'query_idx': topk_idx.cpu(),  # sampling point可視化用
         }
 
     return result_per_class
 
 
 # ==============================================================
-# (2) 修正: top-1〜top-Kまで順位ごとに1枚ずつ描画して保存
-# 旧: visualize_detections()が1枚の画像にすべて描画していた
-# 新: 各順位ごとに1枚（クラス0とクラス1を同じ画像に描画）、合計K枚を保存
+# (1)(2) 修正: top-Kスコアのprint
+# 旧: CLASSES[c]（listインデックス）
+# 新: CLASSES.get(cat_id)（dictキー参照、1始まり）
 # ==============================================================
-def visualize_topk_detections(image_path, result_per_class, output_dir, k=TOP_K):
+def print_topk_scores(result_per_class, k=TOP_K):
+    print("\n===== Top-K Scores per Class =====")
+    for cat_id, info in result_per_class.items():
+        # (1) 修正: CLASSES[c] → CLASSES.get(cat_id)
+        print(f"  Class {cat_id} ({CLASSES.get(cat_id, str(cat_id))}):")
+        for rank in range(min(k, len(info['scores']))):
+            score = info['scores'][rank].item()
+            print(f"    top{rank+1}: score={score:.4f}")
+    print("==================================\n")
+
+
+# ==============================================================
+# (1)(2) 修正: top-1〜top-Kまで順位ごとに1枚ずつ描画して保存
+# 旧: CLASSES[c], CLASS_COLORS[c]（listインデックス）
+#     gt_info引数なし
+# 新: CLASSES.get(cat_id), CLASS_COLORS.get(cat_id)（dictキー参照）
+#     gt_info引数を追加しGTも描画
+# ==============================================================
+def visualize_topk_detections(image_path, result_per_class, output_dir,
+                               gt_info=None, k=TOP_K):
     """
     top-1〜top-Kまで順位ごとに画像を1枚ずつ保存する。
-    各画像にはクラス0とクラス1のその順位のbboxを描画。
+    各画像にはクラス1とクラス2のその順位のbboxを描画。
+    gt_infoが与えられた場合はGT bboxも描画。
 
     出力ファイル名: visualize_top{rank}.jpg (rank=1〜K)
+
+    gt_info: load_gt_for_image()の戻り値
+        [{'category_id': int, 'bbox': [x_min, y_min, w, h]}, ...]
     """
     output_dir = Path(output_dir)
 
-    for rank in range(k):  # rank=0がtop-1
+    for rank in range(k):
         original_image = Image.open(image_path).convert("RGB")
         draw = ImageDraw.Draw(original_image)
         font = ImageFont.load_default()
 
-        for c, info in result_per_class.items():
+        # ----------------------------------------------------------
+        # (2) 追加: GT bboxを描画（白枠、予測bboxと区別）
+        # ----------------------------------------------------------
+        if gt_info is not None:
+            for gt in gt_info:
+                cat_id = gt['category_id']
+                x_min, y_min, w, h = gt['bbox']
+                xmin = int(x_min)
+                ymin = int(y_min)
+                xmax = int(x_min + w)
+                ymax = int(y_min + h)
+
+                draw.rectangle([xmin, ymin, xmax, ymax],
+                                outline="white", width=3)
+                gt_label = f"GT:{CLASSES.get(cat_id, str(cat_id))}"
+                draw.text((xmin, max(ymin - 12, 0)),
+                           gt_label, fill="white", font=font)
+
+        # ----------------------------------------------------------
+        # (1) 修正: 予測bboxの描画
+        # 旧: color = CLASS_COLORS[c], label_text = f"{CLASSES[c]} ..."
+        # 新: color = CLASS_COLORS.get(cat_id), label_text = f"{CLASSES.get(cat_id)} ..."
+        # ----------------------------------------------------------
+        for cat_id, info in result_per_class.items():
             if rank >= len(info['scores']):
-                continue  # クエリ数がK未満の場合のガード
+                continue
 
             score = info['scores'][rank].item()
             box   = info['boxes'][rank]
             xmin, ymin, xmax, ymax = map(int, box)
-            color = CLASS_COLORS[c]
-            label_text = f"{CLASSES[c]} top{rank+1} {score:.3f}"
+            # (1) 修正: dictキー参照に変更
+            color      = CLASS_COLORS.get(cat_id, 'green')
+            label_text = f"{CLASSES.get(cat_id, str(cat_id))} top{rank+1} {score:.3f}"
 
             draw.rectangle([xmin, ymin, xmax, ymax], outline=color, width=3)
             draw.text((xmin, max(ymin - 12, 0)), label_text, fill=color, font=font)
@@ -187,34 +307,10 @@ def visualize_topk_detections(image_path, result_per_class, output_dir, k=TOP_K)
 
 
 # ==============================================================
-# (2) 追加: top-Kスコアをクラスごとにprint
-# ==============================================================
-def print_topk_scores(result_per_class, k=TOP_K):
-    print("\n===== Top-K Scores per Class =====")
-    for c, info in result_per_class.items():
-        print(f"  Class {c} ({CLASSES[c]}):")
-        for rank in range(min(k, len(info['scores']))):
-            score = info['scores'][rank].item()
-            print(f"    top{rank+1}: score={score:.4f}")
-    print("==================================\n")
-
-
-# ==============================================================
-# (3) 追加: Encoder global attention mapの可視化
-# ViTのglobal attention層（1,3,5層目=index 0,2,4）の
-# attention weightを画像上にheatmapとして重ねて描画
-#
-# 前提: modelのforward()が以下を返すように改変済みであること
-#   outputs['enc_attn_weights']: list of [B, num_heads, HW, HW]
-#     index 0,1,2 がそれぞれ global attention 層1,3,5層目
+# (3) Encoder global attention mapの可視化（変更なし）
 # ==============================================================
 def visualize_encoder_attention(image_path, enc_attn_weights_list, output_dir,
                                  layer_names=None):
-    """
-    enc_attn_weights_list: list of Tensor [B, num_heads, HW, HW]
-      各要素がglobal attention層1層分のattention weight
-    layer_names: list of str, 各層の名前（例: ['enc_layer1', 'enc_layer3', 'enc_layer5']）
-    """
     output_dir = Path(output_dir)
     original_image = Image.open(image_path).convert("RGB")
     img_w, img_h = original_image.size
@@ -223,38 +319,24 @@ def visualize_encoder_attention(image_path, enc_attn_weights_list, output_dir,
         layer_names = [f"enc_global_layer{i+1}" for i in range(len(enc_attn_weights_list))]
 
     for layer_idx, (attn, name) in enumerate(zip(enc_attn_weights_list, layer_names)):
-        # attn: [B, num_heads, HW, HW]  B=1前提
-        attn = attn[0]                        # [num_heads, HW, HW]
+        attn = attn[0]
         num_heads, HW, _ = attn.shape
-        H = W = int(HW ** 0.5)               # 正方形のfeature mapを仮定
+        H = W = int(HW ** 0.5)
 
-        # 全headを平均 → [HW, HW]
-        attn_mean = attn.mean(dim=0)          # [HW, HW]
+        attn_mean = attn.mean(dim=0)
+        attn_map  = attn_mean.mean(dim=0).reshape(H, W)
 
-        # CLSトークンがある場合はスキップ; ここではclass token不使用のViTを仮定
-        # 各query位置からの平均attention（各位置がどこを見ているか）
-        attn_map = attn_mean.mean(dim=0)      # [HW]  各key位置への平均attention
-        attn_map = attn_map.reshape(H, W)     # [H, W]
-
-        # [0,1]に正規化
         attn_map = attn_map.cpu().numpy()
         attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
 
         fig, ax = plt.subplots(1, 1, figsize=(8, 8))
         ax.imshow(original_image)
-        ax.imshow(
-            attn_map,
-            extent=[0, img_w, img_h, 0],     # 画像座標系に合わせる
-            alpha=0.5,
-            cmap='jet',
-            interpolation='bilinear',
-        )
+        ax.imshow(attn_map, extent=[0, img_w, img_h, 0],
+                  alpha=0.5, cmap='jet', interpolation='bilinear')
         ax.set_title(f"Encoder Global Attention: {name}", fontsize=12)
         ax.axis('off')
-        plt.colorbar(
-            plt.cm.ScalarMappable(cmap='jet'),
-            ax=ax, fraction=0.03, pad=0.04
-        )
+        plt.colorbar(plt.cm.ScalarMappable(cmap='jet'),
+                     ax=ax, fraction=0.03, pad=0.04)
         save_path = output_dir / f"attn_enc_{name}.jpg"
         plt.savefig(save_path, bbox_inches='tight', dpi=150)
         plt.close()
@@ -262,28 +344,23 @@ def visualize_encoder_attention(image_path, enc_attn_weights_list, output_dir,
 
 
 # ==============================================================
-# (3) 追加: Decoder deformable cross attention mapの可視化
-# 各decoder層のreference pointとattention weightを描画
-#
-# 前提: modelのforward()が以下を返すように改変済みであること
-#   outputs['dec_attn_info']: list of dict（decoder層ごと）
-#     各dictは以下を含む:
-#       'ref_points':     [B, num_queries, num_points, 2]  (x,y 正規化座標)
-#       'attn_weights':   [B, num_queries, num_heads, num_points]
+# (3) 修正: Decoder deformable cross attention mapの可視化
+# 旧: ref_points/attn_weightsのshapeがdec_attn_infoと不一致だった
+# 新: sampling_locationsをattn_weightsで重み付けしてheatmap描画
 # ==============================================================
-def visualize_decoder_attention(image_path, dec_attn_info, output_dir):
+def visualize_decoder_attention(image_path, dec_attn_info_list, output_dir):
     """
-    dec_attn_info: list of dict（decoder層ごと）
+    dec_attn_info_list: list of dict（decoder層ごと）
       各dict:
-        'ref_points':         [B, Q, n_levels, 4]   正規化cx,cy,w,h
-        'attn_weights':       [B, Q, n_heads, n_levels*n_points]
-        'sampling_locations': [B, Q, n_heads, n_levels, n_points, 2]  正規化xy
+        'ref_points':         Tensor [B, Q, n_levels, 4]   正規化cx,cy,w,h
+        'attn_weights':       Tensor [B, Q, n_heads, n_levels*n_points]
+        'sampling_locations': Tensor [B, Q, n_heads, n_levels, n_points, 2]  正規化xy
     """
     output_dir = Path(output_dir)
     original_image = Image.open(image_path).convert("RGB")
     img_w, img_h = original_image.size
 
-    for layer_idx, info in enumerate(dec_attn_info):
+    for layer_idx, info in enumerate(dec_attn_info_list):
         # B=1前提でバッチ次元を除去
         ref_points         = info['ref_points'][0]         # [Q, n_levels, 4]
         attn_weights       = info['attn_weights'][0]       # [Q, n_heads, n_levels*n_points]
@@ -291,24 +368,22 @@ def visualize_decoder_attention(image_path, dec_attn_info, output_dir):
 
         Q, n_heads, n_levels, n_points, _ = sampling_locations.shape
 
-        # -------------------------------------------------------
-        # attention weightで重み付けしたsampling locationのheatmap
-        # attn_weights: [Q, n_heads, n_levels*n_points]
-        #   → [Q, n_heads, n_levels, n_points] にreshape
-        # -------------------------------------------------------
-        attn_w = attn_weights.reshape(Q, n_heads, n_levels, n_points)
-        # head平均 → [Q, n_levels, n_points]
-        attn_w = attn_w.mean(dim=1).cpu().numpy()
-        sampling_locs = sampling_locations.mean(dim=1).cpu().numpy()  # [Q, n_levels, n_points, 2]
+        # head平均
+        attn_w       = attn_weights.reshape(Q, n_heads, n_levels, n_points).mean(dim=1)  # [Q, n_levels, n_points]
+        sampling_locs = sampling_locations.mean(dim=1)                                    # [Q, n_levels, n_points, 2]
 
+        attn_w_np    = attn_w.cpu().numpy()
+        sampling_np  = sampling_locs.cpu().numpy()
+
+        # sampling pointをattn_weightで重み付けしたheatmap
         heatmap = np.zeros((img_h, img_w), dtype=np.float32)
         r = 8
         for q in range(Q):
             for lvl in range(n_levels):
                 for p in range(n_points):
-                    x = int(np.clip(sampling_locs[q, lvl, p, 0] * img_w, 0, img_w - 1))
-                    y = int(np.clip(sampling_locs[q, lvl, p, 1] * img_h, 0, img_h - 1))
-                    w = attn_w[q, lvl, p]
+                    x = int(np.clip(sampling_np[q, lvl, p, 0] * img_w, 0, img_w - 1))
+                    y = int(np.clip(sampling_np[q, lvl, p, 1] * img_h, 0, img_h - 1))
+                    w = attn_w_np[q, lvl, p]
                     y0, y1 = max(0, y - r), min(img_h, y + r + 1)
                     x0, x1 = max(0, x - r), min(img_w, x + r + 1)
                     heatmap[y0:y1, x0:x1] += w
@@ -317,7 +392,7 @@ def visualize_decoder_attention(image_path, dec_attn_info, output_dir):
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
 
-        # 左: attention weight重み付きheatmap
+        # 左: attn weight重み付きsampling pointのheatmap
         axes[0].imshow(original_image)
         axes[0].imshow(heatmap, alpha=0.5, cmap='jet', interpolation='bilinear')
         axes[0].set_title(f"Dec Layer {layer_idx+1}: Sampling Points (weighted by attn)")
@@ -325,7 +400,7 @@ def visualize_decoder_attention(image_path, dec_attn_info, output_dir):
         plt.colorbar(plt.cm.ScalarMappable(cmap='jet'),
                      ax=axes[0], fraction=0.03, pad=0.04)
 
-        # 右: reference pointの散布図（level別に色分け）
+        # 右: reference pointの散布図（level別色分け）
         axes[1].imshow(original_image)
         colors_level = ['red', 'blue', 'green', 'orange']
         for lvl in range(n_levels):
@@ -360,7 +435,7 @@ def main(args):
         checkpoint = torch.load(args.weights, map_location='cpu')
         model.load_state_dict(checkpoint['model'], strict=True)
 
-    # preprocess（変更なし）
+    # preprocess
     image, orig_image_size = preprocess_image(args.input)
     image = image.to(device)
     orig_image_size = orig_image_size.to(device)
@@ -368,35 +443,46 @@ def main(args):
     images = nested_tensor_from_tensor_list([image])
     orig_image_sizes = torch.stack([orig_image_size])
 
-    # ==============================================================
-    # forward
-    # 旧: outputs = model(images)
-    # 新: attention情報も取得（model側の改変が必要、下記NOTE参照）
-    # ==============================================================
     with torch.no_grad():
         outputs = model(images)
 
-    # ==============================================================
-    # (2) 修正: クラス別top-Kのbbox取得
-    # 旧: postprocessors['bbox']で flatten top-100 を使用していた
-    # ==============================================================
+    # (1)(2) クラス別top-K取得（キーが1始まりになった）
     result_per_class = get_topk_per_class(outputs, orig_image_sizes, k=TOP_K)
 
-    # (2) top-Kスコアをprint
+    # top-Kスコアをprint
     print_topk_scores(result_per_class, k=TOP_K)
 
-    # (2) 順位ごとに1枚ずつ描画・保存（合計TOP_K枚）
-    visualize_topk_detections(args.input, result_per_class, args.output_dir, k=TOP_K)
+    # ==============================================================
+    # (2) 追加: GT読み込み
+    # --dataset_dirが指定されている場合のみ実行
+    # ==============================================================
+    gt_info = None
+    if args.dataset_dir is not None:
+        try:
+            gt_info = load_gt_for_image(args.dataset_dir, args.input)
+            print("\n===== GT Info =====")
+            for gt in gt_info:
+                cat_name = CLASSES.get(gt['category_id'], str(gt['category_id']))
+                print(f"  category: {cat_name} (id={gt['category_id']}), "
+                      f"bbox={gt['bbox']}")
+            print("===================\n")
+        except Exception as e:
+            print(f"[WARN] GT読み込み失敗: {e}")
 
     # ==============================================================
-    # (3) Encoder global attention mapの可視化
-    # NOTE: outputs['enc_attn_weights']はmodel側の改変で追加する必要がある
-    #       改変不要ならこのブロックをコメントアウト
+    # (2) 修正: gt_infoを渡して描画
+    # 旧: visualize_topk_detections(args.input, result_per_class, args.output_dir, k=TOP_K)
+    # 新: gt_info引数を追加
     # ==============================================================
+    visualize_topk_detections(
+        args.input, result_per_class, args.output_dir,
+        gt_info=gt_info, k=TOP_K
+    )
+
     if 'enc_attn_weights' in outputs:
         visualize_encoder_attention(
             image_path=args.input,
-            enc_attn_weights_list=outputs['enc_attn_weights'],  # list of [B, heads, HW, HW]
+            enc_attn_weights_list=outputs['enc_attn_weights'],
             output_dir=args.output_dir,
             layer_names=['enc_global_layer1', 'enc_global_layer3', 'enc_global_layer5'],
         )
@@ -404,13 +490,14 @@ def main(args):
         print("[INFO] enc_attn_weights not in outputs. Skip encoder attention visualization.")
 
     # ==============================================================
-    # (3) Decoder deformable cross attention mapの可視化
-    # NOTE: outputs['dec_attn_info']はmodel側の改変で追加する必要がある
+    # (3) 修正: dec_attn_infoをoutputsから直接取得
+    # 旧: dec_attn_info_list, orig_image_size引数が必要だった
+    # 新: orig_image_size不要（sampling_locationsが正規化座標のため）
     # ==============================================================
     if 'dec_attn_info' in outputs:
         visualize_decoder_attention(
             image_path=args.input,
-            dec_attn_info=outputs['dec_attn_info'],
+            dec_attn_info_list=outputs['dec_attn_info'],
             output_dir=args.output_dir,
         )
     else:
@@ -425,373 +512,3 @@ if __name__ == '__main__':
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
     main(args)
-
-####_init change from .lwdetr_demo import build
-####TransformerDecoderLayer.forward_post()
-def forward_post(self, tgt, memory,
-                 tgt_mask=None, memory_mask=None,
-                 tgt_key_padding_mask=None, memory_key_padding_mask=None,
-                 pos=None, query_pos=None, query_sine_embed=None,
-                 is_first=False, reference_points=None,
-                 spatial_shapes=None, level_start_index=None):
-    bs, num_queries, _ = tgt.shape
-
-    # Self-Attention (no changed)
-    q = k = tgt + query_pos
-    v = tgt
-    if self.training:
-        q = torch.cat(q.split(num_queries // self.group_detr, dim=1), dim=0)
-        k = torch.cat(k.split(num_queries // self.group_detr, dim=1), dim=0)
-        v = torch.cat(v.split(num_queries // self.group_detr, dim=1), dim=0)
-    tgt2 = self.self_attn(q, k, v, attn_mask=tgt_mask,
-                          key_padding_mask=tgt_key_padding_mask)[0]
-    if self.training:
-        tgt2 = torch.cat(tgt2.split(bs, dim=0), dim=1)
-    tgt = tgt + self.dropout1(tgt2)
-    tgt = self.norm1(tgt)
-
-    # ==============================================================
-    # from: tgt2 = self.cross_attn(...)
-    # to: tgt2, attn_weights, sampling_locations = self.cross_attn(...)
-    # ==============================================================
-    tgt2, attn_weights, sampling_locations = self.cross_attn(
-        self.with_pos_embed(tgt, query_pos),
-        reference_points,
-        memory,
-        spatial_shapes,
-        level_start_index,
-        memory_key_padding_mask
-    )
-
-    tgt = tgt + self.dropout2(tgt2)
-    tgt = self.norm2(tgt)
-    tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
-    tgt = tgt + self.dropout3(tgt2)
-    tgt = self.norm3(tgt)
-
-    # ==============================================================
-    # from: return tgt
-    # to: return tgt, reference_points, attn_weights, sampling_locations
-    # ==============================================================
-    return tgt, reference_points, attn_weights, sampling_locations
-
-
-def forward(self, tgt, memory, ...):
-    # ==============================================================
-    no changed
-    # ==============================================================
-    return self.forward_post(tgt, memory, tgt_mask, memory_mask,
-                             tgt_key_padding_mask, memory_key_padding_mask,
-                             pos, query_pos, query_sine_embed, is_first,
-                             reference_points, spatial_shapes, level_start_index)
-
-####TransformerDecoder.forward()
-def forward(self, tgt, memory, ...):
-    output = tgt
-    intermediate = []
-    hs_refpoints_unsigmoid = [refpoints_unsigmoid]
-
-    # ==============================================================
-    # 追加: 層ごとのdeformable attention情報を格納するリスト
-    # 各要素はdict:
-    #   'ref_points':        [B, Q, n_levels, 4]  各層のreference point
-    #   'attn_weights':      [B, Q, n_heads, n_levels*n_points]
-    #   'sampling_locations':[B, Q, n_heads, n_levels, n_points, 2]
-    # ==============================================================
-    dec_attn_info = []
-
-    if self.lite_refpoint_refine:
-        if self.bbox_reparam:
-            obj_center, refpoints_input, query_pos, query_sine_embed = get_reference(refpoints_unsigmoid)
-        else:
-            obj_center, refpoints_input, query_pos, query_sine_embed = get_reference(refpoints_unsigmoid.sigmoid())
-
-    for layer_id, layer in enumerate(self.layers):
-        if not self.lite_refpoint_refine:
-            if self.bbox_reparam:
-                obj_center, refpoints_input, query_pos, query_sine_embed = get_reference(refpoints_unsigmoid)
-            else:
-                obj_center, refpoints_input, query_pos, query_sine_embed = get_reference(refpoints_unsigmoid.sigmoid())
-
-        pos_transformation = 1
-        query_pos = query_pos * pos_transformation
-
-        # ==============================================================
-        # 変更: layerの戻り値にattn情報を追加
-        # 旧: output = layer(output, memory, ...)
-        # 新: output, ref_pts, attn_w, sampling_locs = layer(output, memory, ...)
-        # ==============================================================
-        output, ref_pts, attn_w, sampling_locs = layer(
-            output, memory,
-            tgt_mask=tgt_mask,
-            memory_mask=memory_mask,
-            tgt_key_padding_mask=tgt_key_padding_mask,
-            memory_key_padding_mask=memory_key_padding_mask,
-            pos=pos, query_pos=query_pos,
-            query_sine_embed=query_sine_embed,
-            is_first=(layer_id == 0),
-            reference_points=refpoints_input,
-            spatial_shapes=spatial_shapes,
-            level_start_index=level_start_index
-        )
-
-        # ==============================================================
-        # 追加: 層ごとのattn情報を保存
-        # ==============================================================
-        dec_attn_info.append({
-            'ref_points':         ref_pts.detach(),        # [B, Q, n_levels, 4]
-            'attn_weights':       attn_w.detach(),         # [B, Q, n_heads, n_levels*n_points]
-            'sampling_locations': sampling_locs.detach(),  # [B, Q, n_heads, n_levels, n_points, 2]
-        })
-
-        if not self.lite_refpoint_refine:
-            new_refpoints_delta = self.bbox_embed(output)
-            new_refpoints_unsigmoid = self.refpoints_refine(refpoints_unsigmoid, new_refpoints_delta)
-            if layer_id != self.num_layers - 1:
-                hs_refpoints_unsigmoid.append(new_refpoints_unsigmoid)
-            refpoints_unsigmoid = new_refpoints_unsigmoid.detach()
-
-        if self.return_intermediate:
-            intermediate.append(self.norm(output))
-
-    if self.norm is not None:
-        output = self.norm(output)
-        if self.return_intermediate:
-            intermediate.pop()
-            intermediate.append(output)
-
-    if self.return_intermediate:
-        if self.bbox_embed is not None:
-            # ==============================================================
-            # 変更: dec_attn_infoを追加して返す
-            # 旧: return [torch.stack(intermediate), torch.stack(hs_refpoints_unsigmoid)]
-            # 新: return [torch.stack(intermediate), torch.stack(hs_refpoints_unsigmoid)], dec_attn_info
-            # ==============================================================
-            return [
-                torch.stack(intermediate),
-                torch.stack(hs_refpoints_unsigmoid),
-            ], dec_attn_info
-        else:
-            return [
-                torch.stack(intermediate),
-                refpoints_unsigmoid.unsqueeze(0)
-            ], dec_attn_info
-
-    return output.unsqueeze(0), dec_attn_info
-
-###Transformer.forward()
-def forward(self, srcs, masks, pos_embeds, refpoint_embed, query_feat):
-    # ...（前半変更なし）...
-
-    # ==============================================================
-    # 変更: decoderがdec_attn_infoも返すようになった
-    # 旧: hs, references = self.decoder(...)
-    # 新: (hs, references), dec_attn_info = self.decoder(...)
-    # ==============================================================
-    (hs, references), dec_attn_info = self.decoder(
-        tgt, memory,
-        memory_key_padding_mask=mask_flatten,
-        pos=lvl_pos_embed_flatten,
-        refpoints_unsigmoid=refpoint_embed,
-        level_start_index=level_start_index,
-        spatial_shapes=spatial_shapes,
-        valid_ratios=valid_ratios.to(memory.dtype) if valid_ratios is not None else valid_ratios
-    )
-
-    if self.two_stage:
-        if self.bbox_reparam:
-            return hs, references, memory_ts, boxes_ts, dec_attn_info
-        else:
-            return hs, references, memory_ts, boxes_ts.sigmoid(), dec_attn_info
-
-    # ==============================================================
-    # 変更: dec_attn_infoを追加して返す
-    # 旧: return hs, references, None, None
-    # 新: return hs, references, None, None, dec_attn_info
-    # ==============================================================
-    return hs, references, None, None, dec_attn_info
-
-###LWDETR.forward()
-def forward(self, samples, targets=None):
-    features, poss, enc_attn_weights = self.backbone(samples)
-
-    # ==============================================================
-    # 変更: transformerがdec_attn_infoも返すようになった
-    # 旧: hs, ref_unsigmoid, hs_enc, ref_enc = self.transformer(...)
-    # 新: hs, ref_unsigmoid, hs_enc, ref_enc, dec_attn_info = self.transformer(...)
-    # ==============================================================
-    hs, ref_unsigmoid, hs_enc, ref_enc, dec_attn_info = self.transformer(
-        srcs, masks, poss, refpoint_embed_weight, query_feat_weight
-    )
-
-    # ...（bbox/class embed変更なし）...
-
-    out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
-
-    if self.aux_loss:
-        out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
-
-    if self.two_stage:
-        # ...（変更なし）...
-
-    # ==============================================================
-    # only inference
-    # ==============================================================
-
-    
-    if not self.training:
-        out['enc_attn_weights'] = enc_attn_weights
-        out['dec_attn_info'] = dec_attn_info
-
-    return out
-
-### vit.py
-class Attention(nn.Module):
-    """Multi-head Attention block with relative position embeddings."""
-
-    def __init__(
-        self,
-        dim,
-        num_heads=8,
-        qkv_bias=True,
-        use_cae=False,
-    ):
-        """
-        Args:
-            dim (int): Number of input channels.
-            num_heads (int): Number of attention heads.
-            qkv_bias (bool:  If True, add a learnable bias to query, key, value.
-            rel_pos (bool): If True, add relative positional embeddings to the attention map.
-            rel_pos_zero_init (bool): If True, zero initialize relative positional parameters.
-            input_size (int or None): Input resolution for calculating the relative positional
-                parameter size.
-        """
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim**-0.5
-
-        self.use_cae = use_cae
-        if use_cae:
-            self.qkv = nn.Linear(dim, dim * 3, bias=False)
-            self.q_bias = nn.Parameter(torch.zeros(dim))
-            self.v_bias = nn.Parameter(torch.zeros(dim))
-        else:
-            self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.proj = nn.Linear(dim, dim)
-
-    def forward(self, x, mask=None, return_attn=0):
-        B, N, C = x.shape
-        # qkv with shape (B, H, W, 3C)
-        if self.use_cae:
-            qkv_bias = torch.cat((self.q_bias, torch.zeros_like(self.v_bias, requires_grad=False), self.v_bias))
-            qkv = F.linear(input=x, weight=self.qkv.weight, bias=qkv_bias)
-        else:
-            qkv = self.qkv(x)
-
-        # pytorch naive implementation
-        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        attn = (q * self.scale) @ k.transpose(-2, -1)
-        if mask is not None:
-            attn.masked_fill_(mask.reshape(B, 1, 1, N).expand_as(attn), float('-inf'))
-
-        attn = attn.softmax(dim=-1)
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-
-        if return_attn:
-            return x, attn
-
-        return x
-
-
-class Block(nn.Module):
-    """Transformer blocks with support of window attention and residual propagation blocks"""
-
-    def __init__(
-        self,
-        dim,
-        num_heads,
-        mlp_ratio=4.0,
-        qkv_bias=True,
-        drop_path=0.0,
-        norm_layer=nn.LayerNorm,
-        act_layer=nn.GELU,
-        window=False,
-        use_cae=False,
-    ):
-        """
-        Args:
-            dim (int): Number of input channels.
-            num_heads (int): Number of attention heads in each ViT block.
-            mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
-            qkv_bias (bool): If True, add a learnable bias to query, key, value.
-            drop_path (float): Stochastic depth rate.
-            norm_layer (nn.Module): Normalization layer.
-            act_layer (nn.Module): Activation layer.
-            use_rel_pos (bool): If True, add relative positional embeddings to the attention map.
-            rel_pos_zero_init (bool): If True, zero initialize relative positional parameters.
-            use_residual_block (bool): If True, use a residual block after the MLP block.
-            input_size (int or None): Input resolution for calculating the relative positional
-                parameter size.
-        """
-        super().__init__()
-        self.norm1 = norm_layer(dim)
-        self.attn = Attention(
-            dim,
-            num_heads=num_heads,
-            qkv_bias=qkv_bias,
-            use_cae=use_cae,
-        )
-
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
-        self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer)
-
-        self.window = window
-
-        # for cae
-        self.use_cae = use_cae
-        if use_cae:
-            init_values = 0.1
-            self.gamma_1 = nn.Parameter(init_values * torch.ones((dim)),requires_grad=True)
-            self.gamma_2 = nn.Parameter(init_values * torch.ones((dim)),requires_grad=True)
-
-    def forward(self, x, mask=None):
-        """ Transformer Block forward"""
-        B, HW, C = x.shape
-        shortcut = x
-        x = self.norm1(x)
-
-        if not self.window:
-            x = x.reshape(B // 16, 16 * HW, C)
-            if mask is not None:
-                mask = mask.reshape(B // 16, 16 * HW)
-        
-        if self.window:
-            return_attn = 0
-        else:
-            return_attn = 1
-        
-        global_attn = []
-
-        if self.use_cae:
-            x, attn = self.attn(x, mask, return_attn)
-            x = self.gamma_1 * x
-        else:
-            x, attn = self.attn(x, mask, return_attn)
-        global_attn.append(attn)
-
-        if not self.window:
-            x = x.reshape(B, HW, C)
-            if mask is not None:
-                mask = mask.reshape(B, HW)
-
-        x = shortcut + self.drop_path(x)
-        if self.use_cae:
-            x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
-        else:
-            x = x + self.drop_path(self.mlp(self.norm2(x)))
-
-        return x
