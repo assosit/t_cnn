@@ -503,9 +503,77 @@ def main(args):
     else:
         print("[INFO] dec_attn_info not in outputs. Skip decoder attention visualization.")
 
+# --------------------------------------------------------------
+        # [0,1] Sampling point scatter（上位クエリのみ）
+        # 各クエリをtop順に色分け・ラベル付きでプロット
+        # --------------------------------------------------------------
+        axes[0, 1].imshow(original_image)
+        if topk_query_info:
+            for cat_id, qi in topk_query_info.items():
+                for rank, q_idx in enumerate(qi['query_idx']):
+                    # 全level・全pointのsampling locationを散布
+                    for lvl in range(n_levels):
+                        for p in range(n_points):
+                            x = sampling_np[q_idx, lvl, p, 0] * img_w
+                            y = sampling_np[q_idx, lvl, p, 1] * img_h
+                            # top1のみラベル付き、以降はラベルなし（凡例重複防止）
+                            label = f"{qi['label']} top{rank+1} (q={q_idx})" \
+                                    if (lvl == 0 and p == 0) else None
+                            axes[0, 1].scatter(x, y, s=20,
+                                               color=qi['color'],
+                                               alpha=0.8 - rank * 0.1,  # 順位が下がるほど薄く
+                                               label=label,
+                                               marker=f"${rank+1}$")    # 順位番号をマーカーに
+        axes[0, 1].legend(loc='upper right', fontsize=7, markerscale=1.5)
+        axes[0, 1].set_title(f"Dec Layer {layer_idx+1}: Sampling Points\n(Top-{TOP_K} Queries per Class)")
+        axes[0, 1].axis('off')
+
+        # --------------------------------------------------------------
+        # [1,0] Reference point scatter（全クエリ、level別色分け）
+        # ref_points[q, lvl, :2] = cx, cy（正規化座標）
+        # --------------------------------------------------------------
+        axes[1, 0].imshow(original_image)
+        colors_level = ['red', 'blue', 'green', 'orange']
+        for lvl in range(n_levels):
+            cx = ref_np[:, lvl, 0] * img_w   # 全クエリのcx
+            cy = ref_np[:, lvl, 1] * img_h   # 全クエリのcy
+            axes[1, 0].scatter(cx, cy, s=5, alpha=0.4,
+                               color=colors_level[lvl % len(colors_level)],
+                               label=f"level {lvl}")
+        axes[1, 0].legend(loc='upper right', fontsize=8)
+        axes[1, 0].set_title(f"Dec Layer {layer_idx+1}: Reference Points\n(All Queries, per level)")
+        axes[1, 0].axis('off')
+
+        # --------------------------------------------------------------
+        # [1,1] Reference point scatter（上位クエリのみ）
+        # --------------------------------------------------------------
+        axes[1, 1].imshow(original_image)
+        if topk_query_info:
+            for cat_id, qi in topk_query_info.items():
+                for rank, q_idx in enumerate(qi['query_idx']):
+                    for lvl in range(n_levels):
+                        x = ref_np[q_idx, lvl, 0] * img_w
+                        y = ref_np[q_idx, lvl, 1] * img_h
+                        label = f"{qi['label']} top{rank+1} (q={q_idx})" \
+                                if lvl == 0 else None
+                        axes[1, 1].scatter(x, y, s=40,
+                                           color=qi['color'],
+                                           alpha=0.8 - rank * 0.1,
+                                           label=label,
+                                           marker=f"${rank+1}$")
+        axes[1, 1].legend(loc='upper right', fontsize=7, markerscale=1.5)
+        axes[1, 1].set_title(f"Dec Layer {layer_idx+1}: Reference Points\n(Top-{TOP_K} Queries per Class)")
+        axes[1, 1].axis('off')
+
+        plt.tight_layout()
+        save_path = output_dir / f"attn_dec_layer{layer_idx+1}.jpg"
+        plt.savefig(save_path, bbox_inches='tight', dpi=150)
+        plt.close()
+        print(f"[Decoder Attn] saved: {save_path}")
+
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser('LWDETR infer script', parents=[get_args_parser()])
+    parser = argparse.ArgumentParser('LWDETR infer script', parents=[get_args_parser()])\
     args = parser.parse_args()
 
     if args.output_dir:
