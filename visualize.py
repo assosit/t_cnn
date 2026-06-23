@@ -126,6 +126,8 @@ class RandomWhiteLabelPaste(object):
         rotation_range=(-3, 3),
         p=0.5,
         min_bbox_visibility=0.0,
+        white_pixel_thresh=240,   # 追加：白とみなすRGB各チャンネルの下限値
+        max_white_ratio=0.5,      # 追加：bbox内白色ピクセル割合の上限（超えたらスキップ）
     ):
         self.num_labels = num_labels
         self.label_width_ratio = label_width_ratio
@@ -136,6 +138,8 @@ class RandomWhiteLabelPaste(object):
         self.rotation_range = rotation_range
         self.p = p
         self.min_bbox_visibility = min_bbox_visibility
+        self.white_pixel_thresh = white_pixel_thresh
+        self.max_white_ratio = max_white_ratio 
 
     def _get_bbox_center_lines(self, target, img_h):
         center_ys = []
@@ -174,6 +178,20 @@ class RandomWhiteLabelPaste(object):
     def __call__(self, img, target=None):
         if random.random() > self.p:
             return img, target
+        
+        if target is not None and "boxes" in target:
+        img_np = np.array(img)  # (H, W, 3)
+        for box in target["boxes"]:
+            x1, y1, x2, y2 = (int(v.item()) for v in box)
+            crop = img_np[y1:y2, x1:x2]  # bbox領域を切り出し
+            if crop.size == 0:
+                continue
+            # RGB全チャンネルが閾値以上のピクセルを白とみなす
+            white_mask = np.all(crop >= self.white_pixel_thresh, axis=2)
+            white_ratio = white_mask.sum() / (crop.shape[0] * crop.shape[1])
+            if white_ratio > self.max_white_ratio:
+                return img, target  # いずれかのbboxが閾値超えならスキップ
+
         img_w, img_h = img.size
         img_rgba = img.convert("RGBA")
         center_ys = self._get_bbox_center_lines(target, img_h)
