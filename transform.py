@@ -1,288 +1,170 @@
-class LongSideResize(object):
-    def __init__(self, sizes):
-        assert isinstance(sizes, (list, tuple))
-        self.sizes = sizes
+import random
+import math
+import torch
+import torchvision.transforms.functional as F
+from PIL import Image, ImageDraw
+
+
+class RandomWhiteLabelPaste(object):
+    """
+    血清検体容器画像に白い矩形ラベルをランダムに貼り付けるデータ拡張。
+
+    実際の検体容器に巻かれているラベルを模倣し、
+    ラベルに遮られた状態でも血清境界を検出できるよう汎化性能を高める。
+
+    Args:
+        num_labels (tuple): 貼り付けるラベル数の範囲 (min, max)
+        label_width_ratio (tuple): ラベル幅の画像幅に対する比率範囲 (min, max)
+        label_height_ratio (tuple): ラベル高さの画像高さに対する比率範囲 (min, max)
+        fill_color (tuple): ラベルの塗りつぶし色 (R, G, B)。デフォルトは白
+        border_color (tuple or None): ラベル枠線の色。Noneで枠線なし
+        border_width (int): ラベル枠線の太さ (px)
+        rotation_range (tuple): ラベルの回転角度範囲 (degrees)。容器に巻かれたラベルは
+                                 わずかに傾く場合があるため (-5, 5) 程度を推奨
+        p (float): この拡張を適用する確率
+        min_bbox_visibility (float): bboxの中心水平線（評価軸）がラベルに
+                                      遮蔽されることを許容する割合。
+                                      0.0=完全遮蔽を許容, 1.0=一切許容しない
+    """
+
+    def __init__(
+        self,
+        num_labels=(1, 3),
+        label_width_ratio=(0.4, 0.95),
+        label_height_ratio=(0.15, 0.45),
+        fill_color=(255, 255, 255),
+        border_color=(200, 200, 200),
+        border_width=1,
+        rotation_range=(-3, 3),
+        p=0.5,
+        min_bbox_visibility=0.0,
+    ):
+        assert isinstance(num_labels, (list, tuple)) and len(num_labels) == 2
+        assert isinstance(label_width_ratio, (list, tuple)) and len(label_width_ratio) == 2
+        assert isinstance(label_height_ratio, (list, tuple)) and len(label_height_ratio) == 2
+        assert 0.0 <= p <= 1.0
+
+        self.num_labels = num_labels
+        self.label_width_ratio = label_width_ratio
+        self.label_height_ratio = label_height_ratio
+        self.fill_color = fill_color
+        self.border_color = border_color
+        self.border_width = border_width
+        self.rotation_range = rotation_range
+        self.p = p
+        self.min_bbox_visibility = min_bbox_visibility
+
+    def _get_bbox_center_lines(self, target, img_h):
+        """
+        各bboxの中心を2分割する横線のy座標を返す。
+        評価指標がbbox中心線のピクセル差であるため、
+        この線がラベルで隠れないよう制御するオプションに使用する。
+
+        bboxのフォーマット: [x_min, y_min, x_max, y_max] (xyxy)
+        """
+        center_ys = []
+        if target is not None and "boxes" in target:
+            for box in target["boxes"]:
+                y_min, y_max = box[1].item(), box[3].item()
+                center_ys.append((y_min + y_max) / 2.0)
+        return center_ys
+
+    def _label_covers_center_line(self, lx, ly, lw, lh, angle_deg, center_ys):
+        """
+        ラベル矩形（回転あり）がbboxの中心線を覆っているか判定する。
+        簡略化のため、回転を無視した軸並行矩形で判定する（小角度では十分な精度）。
+        """
+        if not center_ys:
+            return False
+        for cy in center_ys:
+            if ly <= cy <= ly + lh:
+                return True
+        return False
+
+    def _generate_label_patch(self, lw, lh, angle_deg):
+        """
+        白いラベルパッチ画像（RGBA）を生成する。
+        枠線と微細なテキスト模倣ラインを追加して実際のラベルに近づける。
+        """
+        patch = Image.new("RGBA", (lw, lh), (*self.fill_color, 255))
+        draw = ImageDraw.Draw(patch)
+
+        # 枠線
+        if self.border_color is not None:
+            draw.rectangle(
+                [0, 0, lw - 1, lh - 1],
+                outline=(*self.border_color, 255),
+                width=self.border_width,
+            )
+
+        # ラベル内の横線（印字されたテキストを模倣）
+        num_lines = random.randint(1, max(1, lh // 14))
+        line_color = (180, 180, 180, 120)
+        for i in range(num_lines):
+            y_line = random.randint(6, max(6, lh - 6))
+            line_width_factor = random.uniform(0.3, 0.85)
+            x_start = random.randint(4, max(4, int(lw * 0.05)))
+            x_end = int(lw * line_width_factor) + x_start
+            x_end = min(x_end, lw - 4)
+            if x_end > x_start:
+                draw.line([(x_start, y_line), (x_end, y_line)], fill=line_color, width=1)
+
+        # 回転
+        if angle_deg != 0:
+            patch = patch.rotate(angle_deg, expand=True, resample=Image.BICUBIC)
+
+        return patch
 
     def __call__(self, img, target=None):
-        size = random.choice(self.sizes)
-        w_orig, h_orig = img.size
+        """
+        Args:
+            img (PIL.Image): 入力画像
+            target (dict or None): アノテーション辞書
+                - "boxes": torch.Tensor, shape (N, 4), フォーマット [x1, y1, x2, y2]
+                - "area": torch.Tensor, shape (N,)
+                - "size": torch.Tensor, shape (2,) [H, W]
+                - その他のキーはそのまま保持
+        Returns:
+            (PIL.Image, dict or None): 拡張後の画像とターゲット（bboxは変更なし）
+        """
+        if random.random() > self.p:
+            return img, target
 
-        if w_orig >= h_orig:
-            new_w = size
-            new_h = int(round(h_orig * size / w_orig))
-        else:
-            new_h = size
-            new_w = int(round(w_orig * size / h_orig))
-        
-        rescaled_img = F.resize(img, (new_h, new_w))
-        w, h = rescaled_img.size
+        img_w, img_h = img.size
+        img_rgba = img.convert("RGBA")
 
-        if target is None:
-            return rescaled_img, None
+        # 評価基準となるbbox中心線のy座標を取得
+        center_ys = self._get_bbox_center_lines(target, img_h)
 
-        ratios = tuple(float(s) / float(s_orig) for s, s_orig in zip(rescaled_img.size, img.size))
-        ratio_width, ratio_height = ratios
+        n_labels = random.randint(self.num_labels[0], self.num_labels[1])
 
-        target = target.copy()
+        for _ in range(n_labels):
+            lw = int(img_w * random.uniform(*self.label_width_ratio))
+            lh = int(img_h * random.uniform(*self.label_height_ratio))
+            lw = max(lw, 10)
+            lh = max(lh, 8)
 
-        # 2. boxをスケール
-        if "boxes" in target:
-            boxes = target["boxes"]
-            scaled_boxes = boxes * torch.as_tensor(
-                [ratio_width, ratio_height, ratio_width, ratio_height],
-            )
-            target["boxes"] = scaled_boxes
+            angle_deg = random.uniform(*self.rotation_range)
 
-        # 3. areaをスケール
-        if "area" in target:
-            area = target["area"]
-            scaled_area = area * (ratio_width * ratio_height)
-            target["area"] = scaled_area
+            # ラベルのx位置：容器に巻かれたラベルを模倣するため左端からはみ出しを許容
+            lx = random.randint(-lw // 4, max(0, img_w - lw * 3 // 4))
+            ly = random.randint(0, max(0, img_h - lh))
 
-        # 4. 変換後画像サイズ
-        target["size"] = torch.tensor([h, w])
-        target["pad_size"] = torch.tensor([H_pad, W_pad])
+            # min_bbox_visibility > 0 の場合、中心線を覆うラベルをスキップ
+            if self.min_bbox_visibility > 0.0:
+                if self._label_covers_center_line(lx, ly, lw, lh, angle_deg, center_ys):
+                    continue
 
-        return rescaled_img, target
+            patch = self._generate_label_patch(lw, lh, angle_deg)
 
-class LongSideResize(object):
-    """
-    長辺を基準にアスペクト比を保ってリサイズ。
-    正方形paddingは行わない。
-    """
-    def __init__(self, sizes):
-        assert isinstance(sizes, (list, tuple))
-        self.sizes = sizes
+            # 回転で拡張されたpatchサイズを取得し、貼り付け位置を調整
+            pw, ph = patch.size
+            paste_x = lx - (pw - lw) // 2
+            paste_y = ly - (ph - lh) // 2
 
-    def __call__(self, img, target=None):
-        # 1. 長辺基準でリサイズ
-        long_side = random.choice(self.sizes)
-        w_orig, h_orig = img.size  # PIL: (width, height)
+            img_rgba.paste(patch, (paste_x, paste_y), patch)
 
-        scale = long_side / max(w_orig, h_orig)
-        new_w = int(round(w_orig * scale))
-        new_h = int(round(h_orig * scale))
+        augmented_img = img_rgba.convert(img.mode)
 
-        resized_img = F.resize(img, (new_h, new_w))  # F.resize は (h, w)
-
-        if target is None:
-            return resized_img, None
-
-        target = target.copy()
-
-        ratio_w = new_w / w_orig
-        ratio_h = new_h / h_orig
-
-        # 2. boxをスケール
-        if "boxes" in target:
-            boxes = target["boxes"]
-            target["boxes"] = boxes * torch.as_tensor(
-                [ratio_w, ratio_h, ratio_w, ratio_h],
-                dtype=boxes.dtype,
-                device=boxes.device,
-            )
-
-        # 3. areaをスケール
-        if "area" in target:
-            target["area"] = target["area"] * (ratio_w * ratio_h)
-
-        # 4. 変換後画像サイズ
-        target["size"] = torch.tensor([new_h, new_w])
-
-        # 5. maskを画像と同じサイズにリサイズ
-        if "masks" in target:
-            target["masks"] = interpolate(
-                target["masks"][:, None].float(),
-                size=(new_h, new_w),
-                mode="nearest",
-            )[:, 0] > 0.5
-
-        return resized_img, target
-    
-
-
-if args.pretrain_weights is not None:
-        checkpoint = torch.load(args.pretrain_weights, map_location='cpu')
-        # add support to exclude_keys
-        # e.g., when load object365 pretrain, do not load `class_embed.[weight, bias]`
-        if args.pretrain_exclude_keys is not None:
-            assert isinstance(args.pretrain_exclude_keys, list)
-            for exclude_key in args.pretrain_exclude_keys:
-                checkpoint['model'].pop(exclude_key)
-        if args.pretrain_keys_modify_to_load is not None:
-            assert isinstance(args.pretrain_keys_modify_to_load, list)
-            for modify_key_to_load in args.pretrain_keys_modify_to_load:
-                if modify_key_to_load in checkpoint['model']:
-                    del checkpoint['model'][modify_key_to_load]
-        model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
-
-if args.pretrain_weights is not None:
-    checkpoint = torch.load(args.pretrain_weights, map_location='cpu')
-    checkpoint_model = checkpoint['model']
-
-    # ---------------------------------------------------------------
-    # 1. pretrain_exclude_keys: 明示的に除外するキーを削除
-    # ---------------------------------------------------------------
-    if args.pretrain_exclude_keys is not None:
-        assert isinstance(args.pretrain_exclude_keys, list)
-        for exclude_key in args.pretrain_exclude_keys:
-            if exclude_key in checkpoint_model:
-                print(f"[Pretrain] Excluding key: {exclude_key}")
-                checkpoint_model.pop(exclude_key)
-
-    # ---------------------------------------------------------------
-    # 2. pretrain_keys_modify_to_load: obj365→coco変換（必要な場合）
-    # ---------------------------------------------------------------
-    if args.pretrain_keys_modify_to_load is not None:
-        from util.obj365_to_coco_model import get_coco_pretrain_from_obj365
-        assert isinstance(args.pretrain_keys_modify_to_load, list)
-        for modify_key_to_load in args.pretrain_keys_modify_to_load:
-            if modify_key_to_load in checkpoint_model:
-                checkpoint_model[modify_key_to_load] = get_coco_pretrain_from_obj365(
-                    model_without_ddp.state_dict()[modify_key_to_load],
-                    checkpoint_model[modify_key_to_load]
-                )
-
-    # ---------------------------------------------------------------
-    # 3. shape不一致キーの自動検出と部分転用
-    #    COCO(81次元) → 自前データ(3次元) のhead重みを処理
-    # ---------------------------------------------------------------
-    current_model_state = model_without_ddp.state_dict()
-    shape_mismatched_keys = []
-    keys_to_remove = []
-
-    for key in list(checkpoint_model.keys()):
-        if key not in current_model_state:
-            # モデルに存在しないキーはスキップ（strict=Falseで対処済みだが明示）
-            print(f"[Pretrain] Key not in current model, skipping: {key}")
-            keys_to_remove.append(key)
-            continue
-
-        ckpt_shape = checkpoint_model[key].shape
-        model_shape = current_model_state[key].shape
-
-        if ckpt_shape != model_shape:
-            shape_mismatched_keys.append(key)
-            print(f"[Pretrain] Shape mismatch - {key}: "
-                  f"checkpoint={ckpt_shape}, model={model_shape}")
-
-            # --- class_embed (分類head) の部分転用 ---
-            # COCOの重みのうち、background(index=0)の重みのみ転用し、
-            # クラス固有の重みは現モデルの初期値を保持する。
-            # （background特徴の汎用性は高いため転用価値がある）
-            if 'class_embed' in key:
-                new_param = current_model_state[key].clone()  # モデルの初期値をベースに
-                src = checkpoint_model[key]  # COCO: shape [81, d] or [81]
-
-                # weight: [num_classes, d_model]  /  bias: [num_classes]
-                # background(index=0)の重みはドメイン不変性が高いため転用
-                min_classes = min(new_param.shape[0], src.shape[0])
-                # index 0 (background) のみ転用
-                new_param[0] = src[0]
-                print(f"[Pretrain] Partially loaded class_embed (background only): {key}")
-                checkpoint_model[key] = new_param
-
-            # --- bbox_embed (回帰head) の部分転用 ---
-            # bbox回帰は座標予測でありクラス非依存な場合が多い。
-            # 次元が合う範囲でできるだけ転用する。
-            elif 'bbox_embed' in key:
-                new_param = current_model_state[key].clone()
-                src = checkpoint_model[key]
-                # 共通次元をスライスして転用（shape違いは先頭次元のみと仮定）
-                min_dim0 = min(new_param.shape[0], src.shape[0])
-                if new_param.dim() == 1:
-                    new_param[:min_dim0] = src[:min_dim0]
-                elif new_param.dim() == 2:
-                    min_dim1 = min(new_param.shape[1], src.shape[1])
-                    new_param[:min_dim0, :min_dim1] = src[:min_dim0, :min_dim1]
-                print(f"[Pretrain] Partially loaded bbox_embed: {key}")
-                checkpoint_model[key] = new_param
-
-            else:
-                # 上記以外のshape不一致キーは除外（strict=Falseで安全にスキップ）
-                print(f"[Pretrain] Skipping mismatched key: {key}")
-                keys_to_remove.append(key)
-
-    # 除外対象キーをcheckpointから削除
-    for key in keys_to_remove:
-        checkpoint_model.pop(key, None)
-
-    # ---------------------------------------------------------------
-    # 4. ロード実行（strict=False: 不足キーは初期値のまま）
-    # ---------------------------------------------------------------
-    missing_keys, unexpected_keys = model_without_ddp.load_state_dict(
-        checkpoint_model, strict=False
-    )
-    print(f"[Pretrain] Missing keys (使用初期値): {missing_keys}")
-    print(f"[Pretrain] Unexpected keys (無視): {unexpected_keys}")
-    print(f"[Pretrain] Shape mismatch keys (部分転用 or スキップ): {shape_mismatched_keys}")
-
-    # ---------------------------------------------------------------
-    # 5. EMAモデルの再構築
-    # ---------------------------------------------------------------
-    if args.use_ema:
-        del ema_m
-        ema_m = ModelEma(model_without_ddp)
-        print("[Pretrain] EMA model re-initialized from loaded weights.")
-
-
-### ver 2
-if args.pretrain_weights is not None:
-    checkpoint = torch.load(args.pretrain_weights, map_location='cpu')
-    checkpoint_model = checkpoint['model']
-
-    # ---------------------------------------------------------------
-    # 1. pretrain_exclude_keys: 明示的に除外するキーを削除
-    # ---------------------------------------------------------------
-    if args.pretrain_exclude_keys is not None:
-        assert isinstance(args.pretrain_exclude_keys, list)
-        for exclude_key in args.pretrain_exclude_keys:
-            if exclude_key in checkpoint_model:
-                print(f"[Pretrain] Excluding key: {exclude_key}")
-                checkpoint_model.pop(exclude_key)
-
-    # ---------------------------------------------------------------
-    # 2. pretrain_keys_modify_to_load: obj365→coco変換（必要な場合）
-    # ---------------------------------------------------------------
-    if args.pretrain_keys_modify_to_load is not None:
-        from util.obj365_to_coco_model import get_coco_pretrain_from_obj365
-        assert isinstance(args.pretrain_keys_modify_to_load, list)
-        for modify_key_to_load in args.pretrain_keys_modify_to_load:
-            if modify_key_to_load in checkpoint_model:
-                checkpoint_model[modify_key_to_load] = get_coco_pretrain_from_obj365(
-                    model_without_ddp.state_dict()[modify_key_to_load],
-                    checkpoint_model[modify_key_to_load]
-                )
-
-    # ---------------------------------------------------------------
-    # 3. shape不一致・モデルに存在しないキーを自動除外
-    #    → 除外されたキーはモデルの初期値がそのまま使われる
-    # ---------------------------------------------------------------
-    current_model_state = model_without_ddp.state_dict()
-    keys_to_remove = []
-
-    for key in list(checkpoint_model.keys()):
-        if key not in current_model_state:
-            keys_to_remove.append(key)
-        elif checkpoint_model[key].shape != current_model_state[key].shape:
-            keys_to_remove.append(key)
-
-    for key in keys_to_remove:
-        print(f"[Pretrain] Skipping key (not in model or shape mismatch): {key}")
-        checkpoint_model.pop(key)
-
-    # ---------------------------------------------------------------
-    # 4. ロード実行
-    # ---------------------------------------------------------------
-    missing_keys, unexpected_keys = model_without_ddp.load_state_dict(
-        checkpoint_model, strict=False
-    )
-    print(f"[Pretrain] Missing keys (初期値を使用): {missing_keys}")
-    print(f"[Pretrain] Skipped keys (初期値を使用): {keys_to_remove}")
-
-    # ---------------------------------------------------------------
-    # 5. EMAモデルの再構築
-    # ---------------------------------------------------------------
-    if args.use_ema:
-        del ema_m
-        ema_m = ModelEma(model_without_ddp)
+        # targetのbboxは変更しない（ラベルで隠れても正解位置は変わらないため）
+        return augmented_img, target
