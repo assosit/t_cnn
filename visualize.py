@@ -1,1080 +1,289 @@
-import argparse
-import copy
+"""
+RandomWhiteLabelPaste デモスクリプト（実画像 + COCO JSON版）
+=============================================================
+256×1536 の実検体容器画像と COCO format アノテーションを読み込み、
+データ拡張の効果を可視化する。
+"""
+
 import json
+import random
 from pathlib import Path
 
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import matplotlib.cm as cm
 import torch
-from PIL import Image, ImageDraw, ImageFont
-from torchvision import transforms
-
-import util.misc as utils
-from models import build_model
-from util.misc import nested_tensor_from_tensor_list
-from util.misc import get_param_dict
-
-# ==============================================================
-# (1) 修正: backgroundなし、上端・下端の2クラスのみ
-# 旧: CLASSES = ['top', 'bottom']  # list、0始まり
-# 新: CLASSES = {1: 'top', 2: 'bottom'}  # dict、1始まり（GT category_idに合わせる）
-# ==============================================================
-CLASSES = {1: 'top', 2: 'bottom'}
-# ==============================================================
-# (1) 修正: CLASS_COLORSもdictに変更
-# 旧: CLASS_COLORS = ['red', 'blue']
-# 新: CLASS_COLORS = {1: 'red', 2: 'blue'}
-# ==============================================================
-CLASS_COLORS = {1: 'red', 2: 'blue'}
-GT_CLASS_COLORS = {1: 'yellow', 2: 'cyan'}
-
-# top-Kの数
-TOP_K = 5  # (2) 各クラスtop-5を取得
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from PIL import Image, ImageDraw
 
 
-def get_args_parser():
-    parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
-    parser.add_argument('--weights', type=str, default=None, required=True)
-    parser.add_argument('--device', default='cuda')
-    parser.add_argument('--pretrained_encoder', type=str, default=None)
-    parser.add_argument('--encoder', default='vit_tiny', type=str)
-    parser.add_argument('--vit_encoder_num_layers', default=12, type=int)
-    parser.add_argument('--window_block_indexes', default=None, type=int, nargs='+')
-    parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'))
-    parser.add_argument('--out_feature_indexes', default=[-1], type=int, nargs='+')
-    parser.add_argument('--dec_layers', default=3, type=int)
-    parser.add_argument('--dim_feedforward', default=2048, type=int)
-    parser.add_argument('--hidden_dim', default=256, type=int)
-    parser.add_argument('--sa_nheads', default=8, type=int)
-    parser.add_argument('--ca_nheads', default=8, type=int)
-    parser.add_argument('--num_queries', default=300, type=int)
-    parser.add_argument('--group_detr', default=13, type=int)
-    parser.add_argument('--two_stage', action='store_true')
-    parser.add_argument('--projector_scale', default='P4', type=str, nargs='+', choices=('P3', 'P4', 'P5', 'P6'))
-    parser.add_argument('--lite_refpoint_refine', action='store_true')
-    parser.add_argument('--num_select', default=100, type=int)
-    parser.add_argument('--dec_n_points', default=4, type=int)
-    parser.add_argument('--decoder_norm', default='LN', type=str)
-    parser.add_argument('--bbox_reparam', action='store_true')
-    parser.add_argument('--dataset_file', default='coco')
-    parser.add_argument('--set_cost_class', default=2, type=float)
-    parser.add_argument('--set_cost_bbox', default=5, type=float)
-    parser.add_argument('--set_cost_giou', default=2, type=float)
-    parser.add_argument('--lr', default=1e-4, type=float)
-    parser.add_argument('--lr_encoder', default=1.5e-4, type=float)
-    parser.add_argument('--batch_size', default=2, type=int)
-    parser.add_argument('--weight_decay', default=1e-4, type=float)
-    parser.add_argument('--epochs', default=12, type=int)
-    parser.add_argument('--lr_drop', default=11, type=int)
-    parser.add_argument('--clip_max_norm', default=0.1, type=float)
-    parser.add_argument('--lr_vit_layer_decay', default=0.8, type=float)
-    parser.add_argument('--lr_component_decay', default=1.0, type=float)
-    parser.add_argument('--dropout', type=float, default=0)
-    parser.add_argument('--drop_path', type=float, default=0)
-    parser.add_argument('--cls_loss_coef', default=2, type=float)
-    parser.add_argument('--bbox_loss_coef', default=5, type=float)
-    parser.add_argument('--giou_loss_coef', default=2, type=float)
-    parser.add_argument('--focal_alpha', default=0.25, type=float)
-    parser.add_argument('--no_aux_loss', dest='aux_loss', action='store_false')
-    parser.add_argument('--sum_group_losses', action='store_true')
-    parser.add_argument('--use_varifocal_loss', action='store_true')
-    parser.add_argument('--use_position_supervised_loss', action='store_true')
-    parser.add_argument('--ia_bce_loss', action='store_true')
-    parser.add_argument('--input', default=None, required=True)
-    parser.add_argument('--output_dir', default='output')
-    parser.add_argument('--confidence_threshold', type=float, default=0.5)
-    # ==============================================================
-    # (2) 追加: GT読み込み用データセットフォルダパス
-    # 旧: なし
-    # 新: --dataset_dir でCOCO形式データセットのルートを指定
-    # ==============================================================
-    parser.add_argument('--dataset_dir', default=None,
-                        help='Path to dataset root directory for loading GT annotations.')
-    return parser
+# ─────────────────────────────────────────
+#  設定
+# ─────────────────────────────────────────
+
+IMAGE_PATH  = "your_image.jpg"          # ← 対象画像のパスに変更
+COCO_PATH   = "annotations.json"        # ← COCO JSON のパスに変更
+OUTPUT_PATH = "augmentation_demo.png"
+RANDOM_SEED = 0
+
+CONFIGS = [
+    dict(label="標準\n(1–3枚, 幅40–95%)",
+         kwargs=dict(num_labels=(1, 3), label_width_ratio=(0.40, 0.95),
+                     label_height_ratio=(0.15, 0.45), rotation_range=(-3, 3),
+                     p=1.0, min_bbox_visibility=0.0)),
+    dict(label="大きめ\n(幅80–100%)",
+         kwargs=dict(num_labels=(1, 2), label_width_ratio=(0.80, 1.00),
+                     label_height_ratio=(0.20, 0.50), rotation_range=(-5, 5),
+                     p=1.0, min_bbox_visibility=0.0)),
+    dict(label="中心線保護\n(visibility=1.0)",
+         kwargs=dict(num_labels=(1, 3), label_width_ratio=(0.40, 0.95),
+                     label_height_ratio=(0.15, 0.45), rotation_range=(-3, 3),
+                     p=1.0, min_bbox_visibility=1.0)),
+    dict(label="多数枚\n(3–5枚)",
+         kwargs=dict(num_labels=(3, 5), label_width_ratio=(0.35, 0.70),
+                     label_height_ratio=(0.10, 0.30), rotation_range=(-4, 4),
+                     p=1.0, min_bbox_visibility=0.0)),
+]
+
+N_SAMPLES = 3   # 同一設定で何パターン生成して並べるか
 
 
-def preprocess_image(image_path):
-    image = Image.open(image_path).convert("RGB")
-    orig_image_size = torch.tensor(image.size[::-1])
-    normalize = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
-    transform = transforms.Compose([
-        transforms.Resize([640, 640]),
-        normalize,
-    ])
-    image = transform(image)
-    return image, orig_image_size
+# ─────────────────────────────────────────
+#  COCO JSON パーサー
+# ─────────────────────────────────────────
 
-
-# ==============================================================
-# (2) 追加: COCOアノテーションから対象画像のGT情報を読み込む関数
-# ==============================================================
-def load_gt_for_image(dataset_dir, image_path):
+def load_coco_target(image_path: str, coco_path: str) -> dict:
     """
-    指定した画像ファイルに対応するGT bbox情報を
-    COCOアノテーションファイルから読み込む。
+    COCO format JSON から指定画像に対応するアノテーションを読み込む。
 
-    Args:
-        dataset_dir: データセットのルートフォルダパス
-                     （annotations/*.jsonが存在するフォルダ）
-        image_path:  可視化対象の画像ファイルパス
+    COCO bbox は [x, y, width, height]（xywh）形式で格納されているため、
+    モデル入力に合わせて [x1, y1, x2, y2]（xyxy）形式に変換して返す。
 
     Returns:
-        gt_info: list of dict
-            [{'category_id': int, 'bbox': [x_min, y_min, w, h]}, ...]
-            bbox はCOCO形式（x_min, y_min, width, height）絶対座標
+        target (dict):
+            boxes  : FloatTensor (N, 4)  — xyxy 形式
+            labels : LongTensor  (N,)    — category_id
+            area   : FloatTensor (N,)
+            image_id : int
+            category_id_to_name : dict   — 描画用ラベル名
     """
-    dataset_dir = Path(dataset_dir)
-    image_filename = Path(image_path).name
+    image_path = Path(image_path)
+    with open(coco_path, "r", encoding="utf-8") as f:
+        coco = json.load(f)
 
-    # annotationsフォルダ内の全jsonを検索
-    ann_candidates = list(dataset_dir.glob('annotations/*.json'))
-    if not ann_candidates:
-        raise FileNotFoundError(f"annotations/*.json が見つかりません: {dataset_dir}")
-
-    # 対象画像が含まれるアノテーションファイルを特定
-    ann_data = None
-    target_image_info = None
-    for ann_path in ann_candidates:
-        with open(ann_path, 'r') as f:
-            data = json.load(f)
-        matched = [img for img in data['images']
-                   if Path(img['file_name']).name == image_filename]
-        if matched:
-            ann_data = data
-            target_image_info = matched[0]
+    # file_name で画像エントリを検索（パスの末尾ファイル名で照合）
+    image_entry = None
+    for img in coco["images"]:
+        if Path(img["file_name"]).name == image_path.name:
+            image_entry = img
             break
+    if image_entry is None:
+        raise ValueError(
+            f"'{image_path.name}' が COCO JSON の images に見つかりません。"
+        )
 
-    if ann_data is None:
-        raise ValueError(f"{image_filename} はいずれのアノテーションファイルにも見つかりません。")
+    image_id = image_entry["id"]
 
-    image_id = target_image_info['id']
+    # category_id → name のマッピング
+    cat_map = {cat["id"]: cat["name"] for cat in coco.get("categories", [])}
 
-    # 該当image_idのannotationを抽出
-    gt_info = [
-        {
-            'category_id': ann['category_id'],  # 1始まり
-            'bbox': ann['bbox'],                 # [x_min, y_min, w, h]
-        }
-        for ann in ann_data['annotations']
-        if ann['image_id'] == image_id
-    ]
+    # 対象画像のアノテーションを収集
+    anns = [a for a in coco["annotations"] if a["image_id"] == image_id]
+    if not anns:
+        raise ValueError(
+            f"image_id={image_id} に対応するアノテーションが見つかりません。"
+        )
 
-    return gt_info
+    boxes, labels, areas = [], [], []
+    for ann in anns:
+        x, y, w, h = ann["bbox"]           # COCO: xywh
+        boxes.append([x, y, x + w, y + h]) # → xyxy
+        labels.append(ann["category_id"])
+        areas.append(ann.get("area", w * h))
 
-
-# ==============================================================
-# (1)(2) 修正: クラス別top-Kのbboxを取得する関数
-# 旧: result_per_class のキーが c（0始まり）
-# 新: result_per_class のキーが c+1（1始まり、GT category_idに対応）
-# ==============================================================
-def get_topk_per_class(outputs, orig_image_sizes, k=TOP_K):
-    from util.box_ops import box_cxcywh_to_xyxy
-
-    out_logits = outputs['pred_logits']  # [B, Q, C=3]
-    out_bbox   = outputs['pred_boxes']   # [B, Q, 4]
-
-    prob = out_logits.sigmoid()
-    B, Q, C = prob.shape
-
-    b = 0
-    img_h, img_w = orig_image_sizes[b]
-    scale = torch.stack([img_w, img_h, img_w, img_h]).float()
-
-    result_per_class = {}
-    for c in range(C):
-        # ==============================================================
-        # 修正: index 0は背景（常に低スコア）なのでスキップ
-        # 旧: category_id = c + 1（スキップなし）
-        # 新: c=0をスキップ、c=1→category_id=1(top)、c=2→category_id=2(bottom)
-        # ==============================================================
-        if c == 0:
-            continue  # index 0 = 背景、スキップ
-
-        category_id = c  # index 1 → id=1(top), index 2 → id=2(bottom)
-
-        topk_k = min(k, Q)
-        topk_scores, topk_idx = torch.topk(prob[b, :, c], topk_k)
-
-        boxes = out_bbox[b, topk_idx]
-        boxes = box_cxcywh_to_xyxy(boxes)
-        boxes = boxes * scale[None, :]
-
-        result_per_class[category_id] = {
-            'scores':    topk_scores.cpu(),
-            'boxes':     boxes.cpu(),
-            'query_idx': topk_idx.cpu(),
-        }
-
-    return result_per_class
+    target = {
+        "boxes":   torch.tensor(boxes,  dtype=torch.float32),
+        "labels":  torch.tensor(labels, dtype=torch.long),
+        "area":    torch.tensor(areas,  dtype=torch.float32),
+        "image_id": image_id,
+        "category_id_to_name": cat_map,
+    }
+    return target
 
 
-# ==============================================================
-# (1)(2) 修正: top-Kスコアのprint
-# 旧: CLASSES[c]（listインデックス）
-# 新: CLASSES.get(cat_id)（dictキー参照、1始まり）
-# ==============================================================
-def print_topk_scores(result_per_class, k=TOP_K):
-    print("\n===== Top-K Scores per Class =====")
-    for cat_id, info in result_per_class.items():
-        print(f"  Class {cat_id} ({CLASSES.get(cat_id, str(cat_id))}):")
-        for rank in range(min(k, len(info['scores']))):
-            score    = info['scores'][rank].item()
-            query_id = info['query_idx'][rank].item()  # 追加
-            print(f"    top{rank+1}: score={score:.4f}, query_idx={query_id}")
-    print("==================================\n")
+# ─────────────────────────────────────────
+#  RandomWhiteLabelPaste クラス
+# ─────────────────────────────────────────
 
+class RandomWhiteLabelPaste(object):
+    def __init__(
+        self,
+        num_labels=(1, 3),
+        label_width_ratio=(0.4, 0.95),
+        label_height_ratio=(0.15, 0.45),
+        fill_color=(255, 255, 255),
+        border_color=(200, 200, 200),
+        border_width=1,
+        rotation_range=(-3, 3),
+        p=0.5,
+        min_bbox_visibility=0.0,
+    ):
+        self.num_labels = num_labels
+        self.label_width_ratio = label_width_ratio
+        self.label_height_ratio = label_height_ratio
+        self.fill_color = fill_color
+        self.border_color = border_color
+        self.border_width = border_width
+        self.rotation_range = rotation_range
+        self.p = p
+        self.min_bbox_visibility = min_bbox_visibility
 
-# ==============================================================
-# (1)(2) 修正: top-1〜top-Kまで順位ごとに1枚ずつ描画して保存
-# 旧: CLASSES[c], CLASS_COLORS[c]（listインデックス）
-#     gt_info引数なし
-# 新: CLASSES.get(cat_id), CLASS_COLORS.get(cat_id)（dictキー参照）
-#     gt_info引数を追加しGTも描画
-# ==============================================================
-def visualize_topk_detections(image_path, result_per_class, output_dir,
-                               gt_info=None, k=TOP_K):
-    """
-    top-1〜top-Kまで順位ごとに画像を1枚ずつ保存する。
-    各画像にはクラス1とクラス2のその順位のbboxを描画。
-    gt_infoが与えられた場合はGT bboxも描画。
+    def _get_bbox_center_lines(self, target, img_h):
+        center_ys = []
+        if target is not None and "boxes" in target:
+            for box in target["boxes"]:
+                y_min, y_max = box[1].item(), box[3].item()
+                center_ys.append((y_min + y_max) / 2.0)
+        return center_ys
 
-    出力ファイル名: visualize_top{rank}.jpg (rank=1〜K)
+    def _label_covers_center_line(self, lx, ly, lw, lh, angle_deg, center_ys):
+        if not center_ys:
+            return False
+        return any(ly <= cy <= ly + lh for cy in center_ys)
 
-    gt_info: load_gt_for_image()の戻り値
-        [{'category_id': int, 'bbox': [x_min, y_min, w, h]}, ...]
-    """
-    output_dir = Path(output_dir)
+    def _generate_label_patch(self, lw, lh, angle_deg):
+        patch = Image.new("RGBA", (lw, lh), (*self.fill_color, 255))
+        draw = ImageDraw.Draw(patch)
+        if self.border_color is not None:
+            draw.rectangle(
+                [0, 0, lw - 1, lh - 1],
+                outline=(*self.border_color, 255),
+                width=self.border_width,
+            )
+        num_lines = random.randint(1, max(1, lh // 14))
+        for _ in range(num_lines):
+            y_line = random.randint(6, max(6, lh - 6))
+            x_start = random.randint(4, max(4, int(lw * 0.05)))
+            x_end = min(int(lw * random.uniform(0.3, 0.85)) + x_start, lw - 4)
+            if x_end > x_start:
+                draw.line([(x_start, y_line), (x_end, y_line)],
+                          fill=(180, 180, 180, 120), width=1)
+        if angle_deg != 0:
+            patch = patch.rotate(angle_deg, expand=True, resample=Image.BICUBIC)
+        return patch
 
-    for rank in range(k):
-        original_image = Image.open(image_path).convert("RGB")
-        draw = ImageDraw.Draw(original_image)
-        font = ImageFont.load_default()
-
-        # ----------------------------------------------------------
-        # (2) 追加: GT bboxを描画（白枠、予測bboxと区別）
-        # ----------------------------------------------------------
-        if gt_info is not None:
-            for gt in gt_info:
-                cat_id = gt['category_id']
-                x_min, y_min, w, h = gt['bbox']
-                xmin = int(x_min)
-                ymin = int(y_min)
-                xmax = int(x_min + w)
-                ymax = int(y_min + h)
-
-                # draw.rectangle([xmin, ymin, xmax, ymax],
-                #                 outline="white", width=3)
-
-                gt_color = GT_CLASS_COLORS.get(cat_id, 'white')
-
-                y_center = (ymin + ymax) // 2
-                draw.line([xmin, y_center, xmax, y_center], fill="white", width=3)
-                gt_label = f"GT:{CLASSES.get(cat_id, str(cat_id))}"
-                draw.text((xmin, max(ymin - 12, 0)),
-                           gt_label, fill="white", font=font)
-
-        # ----------------------------------------------------------
-        # (1) 修正: 予測bboxの描画
-        # 旧: color = CLASS_COLORS[c], label_text = f"{CLASSES[c]} ..."
-        # 新: color = CLASS_COLORS.get(cat_id), label_text = f"{CLASSES.get(cat_id)} ..."
-        # ----------------------------------------------------------
-        for cat_id, info in result_per_class.items():
-            if rank >= len(info['scores']):
-                continue
-
-            score = info['scores'][rank].item()
-            box   = info['boxes'][rank]
-            xmin, ymin, xmax, ymax = map(int, box)
-            # (1) 修正: dictキー参照に変更
-            color      = CLASS_COLORS.get(cat_id, 'green')
-            label_text = f"{CLASSES.get(cat_id, str(cat_id))} top{rank+1} {score:.3f}"
-
-            # draw.rectangle([xmin, ymin, xmax, ymax], outline=color, width=3)
-            
-            y_center = (ymin + ymax) // 2
-            draw.line([xmin, y_center, xmax, y_center], fill=color, width=3)
-            draw.text((xmin, max(ymin - 12, 0)), label_text, fill=color, font=font)
-
-        save_path = output_dir / f"visualize_top{rank+1}.jpg"
-        original_image.save(save_path)
-        print(f"[top{rank+1}] saved: {save_path}")
-
-
-# ==============================================================
-# (3) Encoder global attention mapの可視化（変更なし）
-# ==============================================================
-def visualize_encoder_attention(image_path, enc_attn_weights_list, output_dir,
-                                 layer_names=None):
-    output_dir = Path(output_dir)
-    original_image = Image.open(image_path).convert("RGB")
-    img_w, img_h = original_image.size
-
-    if layer_names is None:
-        layer_names = [f"enc_global_layer{i+1}" for i in range(len(enc_attn_weights_list))]
-
-    for layer_idx, (attn, name) in enumerate(zip(enc_attn_weights_list, layer_names)):
-        attn = attn[0]
-        num_heads, HW, _ = attn.shape
-        H = 48
-        W = 8
-
-        # headを並べるグリッドのレイアウトを決定
-        n_cols = 4
-        n_rows = (num_heads + n_cols - 1) // n_cols  # 切り上げ
-
-        fig, axes = plt.subplots(n_rows, n_cols,
-                                  figsize=(5 * n_cols, 5 * n_rows))
-        axes = axes.flatten()
-
-        im = None
-        for head_idx in range(num_heads):
-            attn_map = attn[head_idx].mean(dim=0).reshape(H, W)
-            attn_map = attn_map.cpu().numpy()
-            attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
-
-            ax = axes[head_idx]
-            ax.imshow(original_image)
-            # imshowの戻り値を保持（colorbar用）
-            im = ax.imshow(attn_map,
-                        extent=[0, img_w, img_h, 0],
-                        alpha=0.5, cmap='jet', interpolation='bilinear')
-            ax.set_title(f"head {head_idx}", fontsize=10)
-            ax.axis('off')
-
-        for idx in range(num_heads, len(axes)):
-            axes[idx].axis('off')
-
-        fig.suptitle(f"Encoder Global Attention: {name}", fontsize=14)
-        plt.tight_layout()
-
-        # ==============================================================
-        # 修正: 画像右側に1つだけcolorbarを追加
-        # 旧: plt.colorbar()なし
-        # 新: fig.colorbar()でfig全体の右端に配置
-        # ==============================================================
-        fig.colorbar(im, ax=axes.tolist(), fraction=0.02, pad=0.02)
-
-        save_path = output_dir / f"attn_enc_{name}.jpg"
-        plt.savefig(save_path, bbox_inches='tight', dpi=150)
-        plt.close()
-
-        # # 余ったサブプロットを非表示
-        # for idx in range(num_heads, len(axes)):
-        #     axes[idx].axis('off')
-
-        # fig.suptitle(f"Encoder Global Attention: {name}", fontsize=14)
-        # plt.tight_layout()
-
-        # save_path = output_dir / f"attn_enc_{name}.jpg"
-        # plt.savefig(save_path, bbox_inches='tight', dpi=150)
-        # plt.close()
-        print(f"[Encoder Attn] saved: {save_path}")
-
-        # attn_mean = attn.mean(dim=0)
-        # attn_map  = attn_mean.mean(dim=0).reshape(H, W)
-
-        # attn_map = attn_map.cpu().numpy()
-        # attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-8)
-
-        # fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-        # ax.imshow(original_image)
-        # ax.imshow(attn_map, extent=[0, img_w, img_h, 0],
-        #           alpha=0.5, cmap='jet', interpolation='bilinear')
-        # ax.set_title(f"Encoder Global Attention: {name}", fontsize=12)
-        # ax.axis('off')
-        # plt.colorbar(plt.cm.ScalarMappable(cmap='jet'),
-        #              ax=ax, fraction=0.03, pad=0.04)
-        # save_path = output_dir / f"attn_enc_{name}.jpg"
-        # plt.savefig(save_path, bbox_inches='tight', dpi=150)
-        # plt.close()
-        # print(f"[Encoder Attn] saved: {save_path}")
-
-def visualize_decoder_attention(image_path, dec_attn_info_list, output_dir,
-                                 result_per_class=None):
-    """
-    Decoder Attention可視化（クラス別・パターン別）。
- 
-    出力: レイヤーごとに 2クラス × 4パターン = 8枚
-        attn_dec_layer{N}_{cat_id}_all.jpg
-        attn_dec_layer{N}_{cat_id}_top1.jpg
-        attn_dec_layer{N}_{cat_id}_top2.jpg
-        attn_dec_layer{N}_{cat_id}_top3.jpg
- 
-    各画像レイアウト（横並び2列）:
-        左: 論文スタイル（sampling点＋reference点＋bbox）
-        右: sampling heatmap（attention weight累積）
- 
-    描画仕様（論文 Deformable DETR Fig.6 (b) 準拠）:
-        - Sampling point : 塗りつぶし円、色=attention weight（青=低 → 赤=高）
-        - Reference point: 緑の十字マーカー（marker='P'）
-        - BBox           : 緑の矩形（top-kパターンのみ）
-        - ラベル         : "カテゴリ スコア" をBBox左上に表示（top-kパターンのみ）
-        - Heatmap        : attention weight累積を jet カラーマップで表示
- 
-    result_per_class の期待フォーマット:
-        {
-            cat_id: {
-                'query_idx': LongTensor [N],   # スコア降順のクエリindex
-                'scores'   : FloatTensor [N],  # 信頼スコア（省略可）
-                'boxes'    : FloatTensor [N,4], # 正規化(cx,cy,w,h)（省略可）
-            }
-        }
-    """
-    output_dir = Path(output_dir)
-    original_image = Image.open(image_path).convert("RGB")
-    img_w, img_h = original_image.size
- 
-    WEIGHT_CMAP = plt.get_cmap('coolwarm')  # 青(低) → 赤(高)
-    HEATMAP_CMAP = plt.get_cmap('jet')
-    TOP_QUERIES = 3
- 
-    # result_per_class が None または空のときは早期リターン
-    if not result_per_class:
-        print("[Decoder Attn] result_per_class が空のためスキップします。")
-        return
- 
-    # ==============================================================
-    # result_per_class を numpy に展開してキャッシュ
-    # class_info[cat_id] = {
-    #     'query_idx': np.ndarray [N],
-    #     'scores'   : np.ndarray [N] or None,
-    #     'boxes'    : np.ndarray [N,4] or None,
-    # }
-    # ==============================================================
-    class_info = {}
-    for cat_id, res_info in result_per_class.items():
-        class_info[cat_id] = {
-            'query_idx': res_info['query_idx'][:TOP_QUERIES].numpy(),
-            'scores'   : (res_info['scores'][:TOP_QUERIES].numpy()
-                          if 'scores' in res_info else None),
-            'boxes'    : (res_info['boxes'][:TOP_QUERIES].numpy()
-                          if 'boxes' in res_info else None),
-        }
- 
-    # ==============================================================
-    # レイヤーループ
-    # ==============================================================
-    for layer_idx, info in enumerate(dec_attn_info_list):
-        ref_points         = info['ref_points'][0]         # [Q, n_levels, 4]
-        attn_weights       = info['attn_weights'][0]       # [Q, n_heads, n_levels*n_points]
-        sampling_locations = info['sampling_locations'][0] # [Q, n_heads, n_levels, n_points, 2]
- 
-        Q, n_heads, n_levels, n_points, _ = sampling_locations.shape
- 
-        # head方向を平均
-        attn_w        = attn_weights.reshape(Q, n_heads, n_levels, n_points).mean(dim=1)
-        sampling_locs = sampling_locations.mean(dim=1)
-        attn_w_np     = attn_w.cpu().numpy()       # [Q, n_levels, n_points]
-        sampling_np   = sampling_locs.cpu().numpy() # [Q, n_levels, n_points, 2]
-        ref_np        = ref_points.cpu().numpy()    # [Q, n_levels, 4]
- 
-        # ==============================================================
-        # 描画ユーティリティ
-        # ==============================================================
- 
-        def draw_sampling_points(ax, q_indices, alpha=0.7, point_size=60):
-            """
-            Sampling pointを塗りつぶし円で描画。
-            色は描画対象クエリ内で正規化したattention weight。
-            全点をまとめて1回の ax.scatter で描画しメモリ・速度を改善。
-            """
-            qs = np.array(q_indices if q_indices is not None else list(range(Q)))
- 
-            # [len(qs), n_levels, n_points] のスライスをまとめて取得
-            locs_q = sampling_np[qs]   # [len(qs), n_levels, n_points, 2]
-            w_q    = attn_w_np[qs]     # [len(qs), n_levels, n_points]
- 
-            # 全点を1次元に展開
-            xs = (locs_q[..., 0] * img_w).ravel()  # [len(qs)*n_levels*n_points]
-            ys = (locs_q[..., 1] * img_h).ravel()
-            ws = w_q.ravel()
- 
-            # attention weightを[0,1]に正規化してRGBA配列に変換
-            w_min, w_max = ws.min(), ws.max()
-            ws_norm = (ws - w_min) / (w_max - w_min + 1e-8)
-            colors = WEIGHT_CMAP(ws_norm)  # [N, 4] RGBA
- 
-            # 1回のscatterで全点を描画
-            ax.scatter(xs, ys, s=point_size, c=colors,
-                       alpha=alpha, zorder=3, linewidths=0)
- 
-        def draw_reference_points(ax, q_indices, marker_size=120):
-            """Reference pointを緑の十字（marker='P'）で描画。level 0 の (cx,cy) を使用。"""
-            qs = q_indices if q_indices is not None else list(range(Q))
-            xs = [ref_np[q, 0, 0] * img_w for q in qs]
-            ys = [ref_np[q, 0, 1] * img_h for q in qs]
-            ax.scatter(xs, ys, s=marker_size, marker='P',
-                       color='limegreen', edgecolors='black', linewidths=0.5,
-                       zorder=5, label='ref point')
- 
-        def draw_bboxes(ax, bbox_list):
-            """
-            BBoxとラベルを描画。
-            bbox_list: list of (cx, cy, w, h, label_str)  ← 正規化座標
-            """
-            for cx, cy, bw, bh, label_str in bbox_list:
-                x0 = (cx - bw / 2) * img_w
-                y0 = (cy - bh / 2) * img_h
-                rect = plt.Rectangle(
-                    (x0, y0), bw * img_w, bh * img_h,
-                    linewidth=2, edgecolor='limegreen', facecolor='none', zorder=4
-                )
-                ax.add_patch(rect)
-                ax.text(x0, y0 - 4, label_str,
-                        fontsize=9, color='white', fontweight='bold',
-                        bbox=dict(boxstyle='round,pad=0.2', fc='limegreen',
-                                  ec='none', alpha=0.85),
-                        va='bottom', ha='left', zorder=6)
- 
-        def make_heatmap(q_indices):
-            """
-            Sampling pointのattention weightを空間に累積したheatmap。
-            numpy_index_add 相当の操作でPythonループを排除し高速化。
-            各点を中心とした (2r+1)×(2r+1) の矩形領域にweightを加算。
-            """
-            r = 8
-            qs = np.array(q_indices if q_indices is not None else list(range(Q)))
- 
-            # 全点の座標・重みをまとめて取得
-            locs_q = sampling_np[qs]  # [len(qs), n_levels, n_points, 2]
-            w_q    = attn_w_np[qs]    # [len(qs), n_levels, n_points]
- 
-            xs = np.clip((locs_q[..., 0] * img_w).ravel().astype(np.int32), 0, img_w - 1)
-            ys = np.clip((locs_q[..., 1] * img_h).ravel().astype(np.int32), 0, img_h - 1)
-            ws = w_q.ravel()
- 
-            # 各点について (2r+1)^2 個のピクセルオフセットを生成してまとめて加算
-            dy, dx = np.meshgrid(np.arange(-r, r + 1), np.arange(-r, r + 1), indexing='ij')
-            dy = dy.ravel()  # [(2r+1)^2]
-            dx = dx.ravel()
- 
-            heatmap = np.zeros((img_h, img_w), dtype=np.float32)
- 
-            # 各点の矩形領域をブロードキャストで一括計算
-            # xs/ys: [N],  dx/dy: [K] → ys_all/xs_all: [N, K]
-            ys_all = np.clip(ys[:, None] + dy[None, :], 0, img_h - 1)  # [N, K]
-            xs_all = np.clip(xs[:, None] + dx[None, :], 0, img_w - 1)  # [N, K]
- 
-            # フラットインデックスに変換して np.add.at で累積加算
-            flat_idx = (ys_all * img_w + xs_all).ravel()          # [N*K]
-            weights  = np.repeat(ws, len(dy))                      # [N*K]
-            np.add.at(heatmap.ravel(), flat_idx, weights)
- 
-            heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
-            return heatmap
- 
-        def render_and_save(title, save_path, q_indices, bbox_list,
-                            point_size, alpha):
-            """
-            左: 論文スタイル（sampling点 + reference点 + bbox）
-            右: sampling heatmap
-            の2列レイアウトで保存。
-            """
-            fig, axes = plt.subplots(1, 2, figsize=(16, 7),
-                                     gridspec_kw={'width_ratios': [1, 1]})
- 
-            # ---- 左: 論文スタイル ----
-            axes[0].imshow(original_image)
-            draw_sampling_points(axes[0], q_indices, alpha=alpha,
-                                 point_size=point_size)
-            draw_reference_points(axes[0], q_indices)
-            if bbox_list:
-                draw_bboxes(axes[0], bbox_list)
- 
-            # sampling pointのカラーバー（左パネル右端）
-            sm = plt.cm.ScalarMappable(cmap=WEIGHT_CMAP,
-                                       norm=plt.Normalize(vmin=0, vmax=1))
-            sm.set_array([])
-            cbar_l = fig.colorbar(sm, ax=axes[0], fraction=0.03, pad=0.02)
-            cbar_l.set_label('attn weight (norm.)', fontsize=8)
-            cbar_l.ax.tick_params(labelsize=7)
- 
-            axes[0].set_title('Sampling & Reference Points', fontsize=10)
-            axes[0].axis('off')
- 
-            # ---- 右: Heatmap ----
-            heatmap = make_heatmap(q_indices)
-            axes[1].imshow(original_image)
-            im = axes[1].imshow(heatmap, alpha=0.55, cmap=HEATMAP_CMAP,
-                                interpolation='bilinear')
-            if bbox_list:
-                draw_bboxes(axes[1], bbox_list)
- 
-            cbar_r = fig.colorbar(im, ax=axes[1], fraction=0.03, pad=0.02)
-            cbar_r.set_label('attn weight (norm.)', fontsize=8)
-            cbar_r.ax.tick_params(labelsize=7)
- 
-            axes[1].set_title('Sampling Heatmap', fontsize=10)
-            axes[1].axis('off')
- 
-            fig.suptitle(title, fontsize=12, y=1.01)
-            plt.tight_layout()
-            plt.savefig(save_path, bbox_inches='tight', dpi=150)
-            plt.close()
-            print(f"[Decoder Attn] saved: {save_path}")
- 
-        # ==============================================================
-        # クラスループ: 各クラスについて 4パターン（all, top1, top2, top3）を出力
-        # ==============================================================
-        for cat_id, cinfo in class_info.items():
-            class_name = CLASSES.get(cat_id, str(cat_id))
-            q_idxs     = cinfo['query_idx']   # np.ndarray [TOP_QUERIES]
-            scores     = cinfo['scores']       # np.ndarray or None
-            boxes      = cinfo['boxes']        # np.ndarray [TOP_QUERIES,4] or None
- 
-            # ----------------------------------------------------------
-            # パターン定義: list of (fname_suffix, title_suffix,
-            #                        q_indices, bbox_list,
-            #                        point_size, alpha)
-            # ----------------------------------------------------------
-            patterns = []
- 
-            # ① all: クラス問わず全クエリを描画（bbox・ラベルなし）
-            patterns.append(dict(
-                fname_suffix = 'all',
-                title_suffix = 'All Queries',
-                q_indices    = None,   # 全クエリ
-                bbox_list    = [],
-                point_size   = 15,
-                alpha        = 0.5,
-            ))
- 
-            # ② top-1 / top-2 / top-3: そのクラスの上位クエリを1つずつ描画
-            for rank in range(TOP_QUERIES):
-                if rank >= len(q_idxs):
+    def __call__(self, img, target=None):
+        if random.random() > self.p:
+            return img, target
+        img_w, img_h = img.size
+        img_rgba = img.convert("RGBA")
+        center_ys = self._get_bbox_center_lines(target, img_h)
+        n_labels = random.randint(self.num_labels[0], self.num_labels[1])
+        for _ in range(n_labels):
+            lw = max(int(img_w * random.uniform(*self.label_width_ratio)), 10)
+            lh = max(int(img_h * random.uniform(*self.label_height_ratio)), 8)
+            angle_deg = random.uniform(*self.rotation_range)
+            lx = random.randint(-lw // 4, max(0, img_w - lw * 3 // 4))
+            ly = random.randint(0, max(0, img_h - lh))
+            if self.min_bbox_visibility > 0.0:
+                if self._label_covers_center_line(lx, ly, lw, lh, angle_deg, center_ys):
                     continue
-                q_idx = int(q_idxs[rank])
- 
-                # ラベル文字列
-                score_str = (f"{scores[rank]:.3f}" if scores is not None else "")
-                label_str = f"{class_name} {score_str}".strip()
- 
-                # BBoxリスト
-                bbox_list = []
-                if boxes is not None:
-                    cx, cy, bw, bh = boxes[rank]
-                    bbox_list.append((cx, cy, bw, bh, label_str))
- 
-                patterns.append(dict(
-                    fname_suffix = f'top{rank+1}',
-                    title_suffix = f"Top-{rank+1} | q={q_idx} | {label_str}",
-                    q_indices    = [q_idx],
-                    bbox_list    = bbox_list,
-                    point_size   = 60,
-                    alpha        = 0.8,
-                ))
- 
-            # ----------------------------------------------------------
-            # 描画・保存
-            # ----------------------------------------------------------
-            for pat in patterns:
-                title = (f"Dec Layer {layer_idx+1} | "
-                         f"{class_name} (cat={cat_id}) | "
-                         f"{pat['title_suffix']}")
-                save_path = (output_dir /
-                             f"attn_dec_layer{layer_idx+1}"
-                             f"_cat{cat_id}_{pat['fname_suffix']}.jpg")
-                render_and_save(
-                    title      = title,
-                    save_path  = save_path,
-                    q_indices  = pat['q_indices'],
-                    bbox_list  = pat['bbox_list'],
-                    point_size = pat['point_size'],
-                    alpha      = pat['alpha'],
-                )
-        
+            patch = self._generate_label_patch(lw, lh, angle_deg)
+            pw, ph = patch.size
+            img_rgba.paste(patch, (lx - (pw - lw) // 2, ly - (ph - lh) // 2), patch)
+        return img_rgba.convert(img.mode), target
 
 
-def main(args):
-    utils.init_distributed_mode(args)
-    print(args)
+# ─────────────────────────────────────────
+#  アノテーション描画ヘルパー
+# ─────────────────────────────────────────
 
-    device = torch.device(args.device)
+# category_id ごとの色（足りない場合は循環）
+_PALETTE = ["#e05c2a", "#1a6ec4", "#2ca02c", "#9467bd", "#d62728", "#8c564b"]
 
-    model, _, postprocessors = build_model(args)
-    model.to(device)
-    model.eval()
+def draw_annotations(ax, target):
+    cat_map = target.get("category_id_to_name", {})
+    for i, (box, cat_id) in enumerate(
+        zip(target["boxes"].numpy(), target["labels"].numpy())
+    ):
+        x1, y1, x2, y2 = box
+        color = _PALETTE[int(cat_id) % len(_PALETTE)]
+        cy = (y1 + y2) / 2.0
+        ax.add_patch(mpatches.Rectangle(
+            (x1, y1), x2 - x1, y2 - y1,
+            linewidth=1.0, edgecolor=color, facecolor="none",
+        ))
+        ax.axhline(cy, color=color, linewidth=0.8, linestyle="--", alpha=0.85)
+        label_name = cat_map.get(int(cat_id), f"cat{cat_id}")
+        ax.text(x2 + 2, cy, f"{label_name}\ncy={int(cy)}px",
+                color=color, fontsize=6, va="center")
 
-    param_dicts = get_param_dict(args, model)
 
-    if args.weights:
-        checkpoint = torch.load(args.weights, map_location='cpu')
-        model.load_state_dict(checkpoint['model'], strict=True)
+# ─────────────────────────────────────────
+#  メイン
+# ─────────────────────────────────────────
 
-    # preprocess
-    image, orig_image_size = preprocess_image(args.input)
-    image = image.to(device)
-    orig_image_size = orig_image_size.to(device)
+def main():
+    random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
 
-    images = nested_tensor_from_tensor_list([image])
-    orig_image_sizes = torch.stack([orig_image_size])
+    orig_img = Image.open(IMAGE_PATH).convert("RGB")
+    target   = load_coco_target(IMAGE_PATH, COCO_PATH)
 
-    with torch.no_grad():
-        outputs = model(images)
+    print(f"image : {IMAGE_PATH}  ({orig_img.size[0]}×{orig_img.size[1]})")
+    print(f"annotations: {len(target['boxes'])} boxes")
+    cat_map = target.get("category_id_to_name", {})
+    for box, cat_id in zip(target["boxes"].numpy(), target["labels"].numpy()):
+        print(f"  [{cat_map.get(int(cat_id), cat_id)}]  xyxy={box.tolist()}")
 
-    # (1)(2) クラス別top-K取得（キーが1始まりになった）
-    result_per_class = get_topk_per_class(outputs, orig_image_sizes, k=TOP_K)
-
-    # top-Kスコアをprint
-    print_topk_scores(result_per_class, k=TOP_K)
-
-    # ==============================================================
-    # (2) 追加: GT読み込み
-    # --dataset_dirが指定されている場合のみ実行
-    # ==============================================================
-    gt_info = None
-    if args.dataset_dir is not None:
-        try:
-            gt_info = load_gt_for_image(args.dataset_dir, args.input)
-            print("\n===== GT Info =====")
-            for gt in gt_info:
-                cat_name = CLASSES.get(gt['category_id'], str(gt['category_id']))
-                print(f"  category: {cat_name} (id={gt['category_id']}), "
-                      f"bbox={gt['bbox']}")
-            print("===================\n")
-        except Exception as e:
-            print(f"[WARN] GT読み込み失敗: {e}")
-
-    # ==============================================================
-    # (2) 修正: gt_infoを渡して描画
-    # 旧: visualize_topk_detections(args.input, result_per_class, args.output_dir, k=TOP_K)
-    # 新: gt_info引数を追加
-    # ==============================================================
-    visualize_topk_detections(
-        args.input, result_per_class, args.output_dir,
-        gt_info=gt_info, k=TOP_K
+    n_cols = 1 + N_SAMPLES
+    n_rows = len(CONFIGS)
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(2.4 * n_cols, 5.0 * n_rows),
+        gridspec_kw={"wspace": 0.04, "hspace": 0.20},
     )
+    if n_rows == 1:
+        axes = [axes]
 
-    if 'enc_attn_weights' in outputs:
-        visualize_encoder_attention(
-            image_path=args.input,
-            enc_attn_weights_list=outputs['enc_attn_weights'],
-            output_dir=args.output_dir,
-            layer_names=['enc_global_layer1', 'enc_global_layer3', 'enc_global_layer5'],
-        )
-    else:
-        print("[INFO] enc_attn_weights not in outputs. Skip encoder attention visualization.")
+    for row, cfg in enumerate(CONFIGS):
+        transform = RandomWhiteLabelPaste(**cfg["kwargs"])
+        for col in range(n_cols):
+            ax = axes[row][col]
+            ax.axis("off")
+            if col == 0:
+                ax.imshow(orig_img)
+                draw_annotations(ax, target)
+                if row == 0:
+                    ax.set_title("元画像", fontsize=8)
+                ax.set_ylabel(cfg["label"], fontsize=7, rotation=0,
+                              labelpad=60, va="center")
+            else:
+                aug_img, aug_target = transform(orig_img.copy(), target)
+                ax.imshow(aug_img)
+                draw_annotations(ax, aug_target)
+                if row == 0:
+                    ax.set_title(f"sample {col}", fontsize=8)
 
-    # ==============================================================
-    # (3) 修正: dec_attn_infoをoutputsから直接取得
-    # 旧: dec_attn_info_list, orig_image_size引数が必要だった
-    # 新: orig_image_size不要（sampling_locationsが正規化座標のため）
-    # ==============================================================
-    if 'dec_attn_info' in outputs:
-        visualize_decoder_attention(
-            image_path=args.input,
-            dec_attn_info_list=outputs['dec_attn_info'],
-            output_dir=args.output_dir,
-            result_per_class=result_per_class,
-        )
-    else:
-        print("[INFO] dec_attn_info not in outputs. Skip decoder attention visualization.")
+    # 凡例をカテゴリ名から動的生成
+    cat_map = target.get("category_id_to_name", {})
+    legend_elements = [
+        mpatches.Patch(facecolor="none",
+                       edgecolor=_PALETTE[cid % len(_PALETTE)],
+                       label=f"{name} bbox / 中心線")
+        for cid, name in sorted(cat_map.items())
+    ]
+    legend_elements.append(
+        mpatches.Patch(facecolor="white", edgecolor="#aaa", label="貼付ラベル（白矩形）")
+    )
+    fig.legend(handles=legend_elements, loc="lower center",
+               ncol=len(legend_elements), fontsize=8,
+               frameon=True, bbox_to_anchor=(0.5, -0.01))
+    fig.suptitle("RandomWhiteLabelPaste — 各設定での拡張結果", fontsize=10, y=1.01)
+
+    plt.savefig(OUTPUT_PATH, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"\nsaved: {OUTPUT_PATH}")
 
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser('LWDETR infer script', parents=[get_args_parser()])
-    args = parser.parse_args()
-
-    if args.output_dir:
-        Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-
-    main(args)
-
-def visualize_decoder_attention(image_path, dec_attn_info_list, output_dir,
-                                 result_per_class=None):
-    """
-    Decoder Attention可視化（クラス別・パターン別）。
- 
-    出力: レイヤーごとに 2クラス × 4パターン = 8枚
-        attn_dec_layer{N}_{cat_id}_all.jpg
-        attn_dec_layer{N}_{cat_id}_top1.jpg
-        attn_dec_layer{N}_{cat_id}_top2.jpg
-        attn_dec_layer{N}_{cat_id}_top3.jpg
- 
-    各画像レイアウト（横並び2列）:
-        左: 論文スタイル（sampling点＋reference点＋bbox）
-        右: sampling heatmap（attention weight累積）
- 
-    描画仕様（論文 Deformable DETR Fig.6 (b) 準拠）:
-        - Sampling point : 塗りつぶし円、色=attention weight（青=低 → 赤=高）
-        - Reference point: 緑の十字マーカー（marker='P'）
-        - BBox           : 緑の矩形（top-kパターンのみ）
-        - ラベル         : "カテゴリ スコア" をBBox左上に表示（top-kパターンのみ）
-        - Heatmap        : attention weight累積を jet カラーマップで表示
- 
-    result_per_class の期待フォーマット:
-        {
-            cat_id: {
-                'query_idx': LongTensor [N],   # スコア降順のクエリindex
-                'scores'   : FloatTensor [N],  # 信頼スコア（省略可）
-                'boxes'    : FloatTensor [N,4], # 正規化(cx,cy,w,h)（省略可）
-            }
-        }
-    """
-    output_dir = Path(output_dir)
-    original_image = Image.open(image_path).convert("RGB")
-    img_w, img_h = original_image.size
- 
-    WEIGHT_CMAP = plt.get_cmap('coolwarm')  # 青(低) → 赤(高)
-    HEATMAP_CMAP = plt.get_cmap('jet')
-    TOP_QUERIES = 3
- 
-    # result_per_class が None または空のときは早期リターン
-    if not result_per_class:
-        print("[Decoder Attn] result_per_class が空のためスキップします。")
-        return
- 
-    # ==============================================================
-    # result_per_class を numpy に展開してキャッシュ
-    # class_info[cat_id] = {
-    #     'query_idx': np.ndarray [N],
-    #     'scores'   : np.ndarray [N] or None,
-    #     'boxes'    : np.ndarray [N,4] or None,
-    # }
-    # ==============================================================
-    class_info = {}
-    for cat_id, res_info in result_per_class.items():
-        class_info[cat_id] = {
-            'query_idx': res_info['query_idx'][:TOP_QUERIES].numpy(),
-            'scores'   : (res_info['scores'][:TOP_QUERIES].numpy()
-                          if 'scores' in res_info else None),
-            'boxes'    : (res_info['boxes'][:TOP_QUERIES].numpy()
-                          if 'boxes' in res_info else None),
-        }
- 
-    # ==============================================================
-    # レイヤーループ
-    # ==============================================================
-    for layer_idx, info in enumerate(dec_attn_info_list):
-        ref_points         = info['ref_points'][0]         # [Q, n_levels, 4]
-        attn_weights       = info['attn_weights'][0]       # [Q, n_heads, n_levels*n_points]
-        sampling_locations = info['sampling_locations'][0] # [Q, n_heads, n_levels, n_points, 2]
- 
-        Q, n_heads, n_levels, n_points, _ = sampling_locations.shape
- 
-        # head方向を平均
-        attn_w        = attn_weights.reshape(Q, n_heads, n_levels, n_points).mean(dim=1)
-        sampling_locs = sampling_locations.mean(dim=1)
-        attn_w_np     = attn_w.cpu().numpy()       # [Q, n_levels, n_points]
-        sampling_np   = sampling_locs.cpu().numpy() # [Q, n_levels, n_points, 2]
-        ref_np        = ref_points.cpu().numpy()    # [Q, n_levels, 4]
- 
-        # ==============================================================
-        # 描画ユーティリティ
-        # ==============================================================
- 
-        def draw_sampling_points(ax, q_indices, alpha=0.7, point_size=60):
-            """
-            Sampling pointを塗りつぶし円で描画。
-            色は描画対象クエリ内で正規化したattention weight。
-            全点をまとめて1回の ax.scatter で描画しメモリ・速度を改善。
-            """
-            qs = np.array(q_indices if q_indices is not None else list(range(Q)))
- 
-            # [len(qs), n_levels, n_points] のスライスをまとめて取得
-            locs_q = sampling_np[qs]   # [len(qs), n_levels, n_points, 2]
-            w_q    = attn_w_np[qs]     # [len(qs), n_levels, n_points]
- 
-            # 全点を1次元に展開
-            xs = (locs_q[..., 0] * img_w).ravel()  # [len(qs)*n_levels*n_points]
-            ys = (locs_q[..., 1] * img_h).ravel()
-            ws = w_q.ravel()
- 
-            # attention weightを[0,1]に正規化してRGBA配列に変換
-            w_min, w_max = ws.min(), ws.max()
-            ws_norm = (ws - w_min) / (w_max - w_min + 1e-8)
-            colors = WEIGHT_CMAP(ws_norm)  # [N, 4] RGBA
- 
-            # 1回のscatterで全点を描画
-            ax.scatter(xs, ys, s=point_size, c=colors,
-                       alpha=alpha, zorder=3, linewidths=0)
- 
-        def draw_reference_points(ax, q_indices, marker_size=120):
-            """Reference pointを緑の十字（marker='P'）で描画。level 0 の (cx,cy) を使用。"""
-            qs = q_indices if q_indices is not None else list(range(Q))
-            xs = [ref_np[q, 0, 0] * img_w for q in qs]
-            ys = [ref_np[q, 0, 1] * img_h for q in qs]
-            ax.scatter(xs, ys, s=marker_size, marker='P',
-                       color='limegreen', edgecolors='black', linewidths=0.5,
-                       zorder=5, label='ref point')
- 
-        def draw_bboxes(ax, bbox_list):
-            """
-            BBoxとラベルを描画。
-            bbox_list: list of (cx, cy, w, h, label_str)  ← 正規化座標
-            """
-            for cx, cy, bw, bh, label_str in bbox_list:
-                x0 = (cx - bw / 2) * img_w
-                y0 = (cy - bh / 2) * img_h
-                rect = plt.Rectangle(
-                    (x0, y0), bw * img_w, bh * img_h,
-                    linewidth=2, edgecolor='limegreen', facecolor='none', zorder=4
-                )
-                ax.add_patch(rect)
-                ax.text(x0, y0 - 4, label_str,
-                        fontsize=9, color='white', fontweight='bold',
-                        bbox=dict(boxstyle='round,pad=0.2', fc='limegreen',
-                                  ec='none', alpha=0.85),
-                        va='bottom', ha='left', zorder=6)
- 
-        def make_heatmap(q_indices):
-            """
-            Sampling pointのattention weightを空間に累積したheatmap。
-            numpy_index_add 相当の操作でPythonループを排除し高速化。
-            各点を中心とした (2r+1)×(2r+1) の矩形領域にweightを加算。
-            """
-            r = 8
-            qs = np.array(q_indices if q_indices is not None else list(range(Q)))
- 
-            # 全点の座標・重みをまとめて取得
-            locs_q = sampling_np[qs]  # [len(qs), n_levels, n_points, 2]
-            w_q    = attn_w_np[qs]    # [len(qs), n_levels, n_points]
- 
-            xs = np.clip((locs_q[..., 0] * img_w).ravel().astype(np.int32), 0, img_w - 1)
-            ys = np.clip((locs_q[..., 1] * img_h).ravel().astype(np.int32), 0, img_h - 1)
-            ws = w_q.ravel()
- 
-            # 各点について (2r+1)^2 個のピクセルオフセットを生成してまとめて加算
-            dy, dx = np.meshgrid(np.arange(-r, r + 1), np.arange(-r, r + 1), indexing='ij')
-            dy = dy.ravel()  # [(2r+1)^2]
-            dx = dx.ravel()
- 
-            heatmap = np.zeros((img_h, img_w), dtype=np.float32)
- 
-            # 各点の矩形領域をブロードキャストで一括計算
-            # xs/ys: [N],  dx/dy: [K] → ys_all/xs_all: [N, K]
-            ys_all = np.clip(ys[:, None] + dy[None, :], 0, img_h - 1)  # [N, K]
-            xs_all = np.clip(xs[:, None] + dx[None, :], 0, img_w - 1)  # [N, K]
- 
-            # フラットインデックスに変換して np.add.at で累積加算
-            flat_idx = (ys_all * img_w + xs_all).ravel()          # [N*K]
-            weights  = np.repeat(ws, len(dy))                      # [N*K]
-            np.add.at(heatmap.ravel(), flat_idx, weights)
- 
-            heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
-            return heatmap
- 
-        def render_and_save(title, save_path, q_indices, bbox_list,
-                            point_size, alpha):
-            """
-            左: 論文スタイル（sampling点 + reference点 + bbox）
-            右: sampling heatmap
-            の2列レイアウトで保存。
-            """
-            fig, axes = plt.subplots(1, 2, figsize=(16, 7),
-                                     gridspec_kw={'width_ratios': [1, 1]})
- 
-            # ---- 左: 論文スタイル ----
-            axes[0].imshow(original_image)
-            draw_sampling_points(axes[0], q_indices, alpha=alpha,
-                                 point_size=point_size)
-            draw_reference_points(axes[0], q_indices)
-            if bbox_list:
-                draw_bboxes(axes[0], bbox_list)
- 
-            # sampling pointのカラーバー（左パネル右端）
-            sm = plt.cm.ScalarMappable(cmap=WEIGHT_CMAP,
-                                       norm=plt.Normalize(vmin=0, vmax=1))
-            sm.set_array([])
-            cbar_l = fig.colorbar(sm, ax=axes[0], fraction=0.03, pad=0.02)
-            cbar_l.set_label('attn weight (norm.)', fontsize=8)
-            cbar_l.ax.tick_params(labelsize=7)
- 
-            axes[0].set_title('Sampling & Reference Points', fontsize=10)
-            axes[0].axis('off')
- 
-            # ---- 右: Heatmap ----
-            heatmap = make_heatmap(q_indices)
-            axes[1].imshow(original_image)
-            im = axes[1].imshow(heatmap, alpha=0.55, cmap=HEATMAP_CMAP,
-                                interpolation='bilinear')
-            if bbox_list:
-                draw_bboxes(axes[1], bbox_list)
- 
-            cbar_r = fig.colorbar(im, ax=axes[1], fraction=0.03, pad=0.02)
-            cbar_r.set_label('attn weight (norm.)', fontsize=8)
-            cbar_r.ax.tick_params(labelsize=7)
- 
-            axes[1].set_title('Sampling Heatmap', fontsize=10)
-            axes[1].axis('off')
- 
-            fig.suptitle(title, fontsize=12, y=1.01)
-            plt.tight_layout()
-            plt.savefig(save_path, bbox_inches='tight', dpi=150)
-            plt.close()
-            print(f"[Decoder Attn] saved: {save_path}")
- 
-        # ==============================================================
-        # クラスループ: 各クラスについて 4パターン（all, top1, top2, top3）を出力
-        # ==============================================================
-        for cat_id, cinfo in class_info.items():
-            class_name = CLASSES.get(cat_id, str(cat_id))
-            q_idxs     = cinfo['query_idx']   # np.ndarray [TOP_QUERIES]
-            scores     = cinfo['scores']       # np.ndarray or None
-            boxes      = cinfo['boxes']        # np.ndarray [TOP_QUERIES,4] or None
- 
-            # ----------------------------------------------------------
-            # パターン定義: list of (fname_suffix, title_suffix,
-            #                        q_indices, bbox_list,
-            #                        point_size, alpha)
-            # ----------------------------------------------------------
-            patterns = []
- 
-            # ① all: そのクラスのtop-k全クエリを描画（bbox・ラベルなし）
-            patterns.append(dict(
-                fname_suffix = 'all',
-                title_suffix = f'Top-{TOP_QUERIES} Queries',
-                q_indices    = [int(i) for i in q_idxs],  # top-kのみ
-                bbox_list    = [],
-                point_size   = 40,
-                alpha        = 0.7,
-            ))
- 
-            # ② top-1 / top-2 / top-3: そのクラスの上位クエリを1つずつ描画
-            for rank in range(TOP_QUERIES):
-                if rank >= len(q_idxs):
-                    continue
-                q_idx = int(q_idxs[rank])
- 
-                # ラベル文字列
-                score_str = (f"{scores[rank]:.3f}" if scores is not None else "")
-                label_str = f"{class_name} {score_str}".strip()
- 
-                # BBoxリスト
-                bbox_list = []
-                if boxes is not None:
-                    cx, cy, bw, bh = boxes[rank]
-                    bbox_list.append((cx, cy, bw, bh, label_str))
- 
-                patterns.append(dict(
-                    fname_suffix = f'top{rank+1}',
-                    title_suffix = f"Top-{rank+1} | q={q_idx} | {label_str}",
-                    q_indices    = [q_idx],
-                    bbox_list    = bbox_list,
-                    point_size   = 60,
-                    alpha        = 0.8,
-                ))
- 
-            # ----------------------------------------------------------
-            # 描画・保存
-            # ----------------------------------------------------------
-            for pat in patterns:
-                title = (f"Dec Layer {layer_idx+1} | "
-                         f"{class_name} (cat={cat_id}) | "
-                         f"{pat['title_suffix']}")
-                save_path = (output_dir /
-                             f"attn_dec_layer{layer_idx+1}"
-                             f"_cat{cat_id}_{pat['fname_suffix']}.jpg")
-                render_and_save(
-                    title      = title,
-                    save_path  = save_path,
-                    q_indices  = pat['q_indices'],
-                    bbox_list  = pat['bbox_list'],
-                    point_size = pat['point_size'],
-                    alpha      = pat['alpha'],
-                )
+if __name__ == "__main__":
+    main()
