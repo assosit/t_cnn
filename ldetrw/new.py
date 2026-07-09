@@ -1,113 +1,120 @@
-def loss_boxes(self, outputs, targets, indices, num_boxes):
-    assert 'pred_boxes' in outputs
-    idx = self._get_src_permutation_idx(indices)
-    src_boxes = outputs['pred_boxes'][idx]
-    target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+def compute_cy_recall(outputs, targets, postprocessors,
+                      thresholds=[7, 15, 25],
+                      symmetric=False):
+    orig_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
+    results = postprocessors['bbox'](outputs, orig_sizes)
 
-    # --- 通常のL1損失 (cx, w, h成分) ---
-    loss_bbox_base = F.l1_loss(src_boxes, target_boxes, reduction='none')
+    stats = {f'recall_{cls}_{th}': []
+             for cls in ['top', 'bot']
+             for th in thresholds}
 
-    # --- cy成分の非対称L1損失 ---
-    # src_boxes, target_boxes は (cx, cy, w, h) フォーマット
-    delta_cy = src_boxes[:, 1] - target_boxes[:, 1]  # pred_cy - gt_cy
+    for pred, target in zip(results, targets):
+        pred_boxes  = pred['boxes']
+        pred_scores = pred['scores']
+        pred_labels = pred['labels']
 
-    # 各boxのクラスラベルを取得
-    target_labels = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-    # 0: top (上端), 1: bottom (下端) を想定
-    is_top = (target_labels == 0)   # 上端クラス
-    is_bot = (target_labels == 1)   # 下端クラス
+        gt_boxes  = target['boxes']
+        gt_labels = target['labels']
+        orig_h, orig_w = target['orig_size']
 
-    alpha = self.asymmetric_alpha  # ペナルティ係数 (例: 3.0)
+        gt_boxes_xyxy = box_ops.box_cxcywh_to_xyxy(gt_boxes)
+        gt_boxes_xyxy = gt_boxes_xyxy * torch.tensor(
+            [orig_w, orig_h, orig_w, orig_h],
+            device=gt_boxes.device, dtype=gt_boxes.dtype
+        )
 
-    # 上端: delta_cy < 0 (予測がGTより上) に厳しいペナルティ
-    penalty_top = torch.where(
-        delta_cy < 0,
-        alpha * delta_cy.abs(),   # 厳しいペナルティ
-        delta_cy.abs()            # 通常ペナルティ
-    )
+        for gt_idx in range(len(gt_labels)):
+            gt_label = gt_labels[gt_idx].item()
+            gt_box   = gt_boxes_xyxy[gt_idx]
+            gt_cy_px = (gt_box[1] + gt_box[3]) / 2
 
-    # 下端: delta_cy > 0 (予測がGTより下) に厳しいペナルティ
-    penalty_bot = torch.where(
-        delta_cy > 0,
-        alpha * delta_cy.abs(),   # 厳しいペナルティ
-        delta_cy.abs()            # 通常ペナルティ
-    )
+            cls_name = 'top' if gt_label == 0 else 'bot'
 
-    # cy損失を合成 (top/bot以外は通常L1のまま)
-    loss_cy = torch.where(is_top, penalty_top,
-              torch.where(is_bot, penalty_bot,
-              delta_cy.abs()))  # 想定外クラスはフォールバック
+            cls_mask = (pred_labels == gt_label)
+            if cls_mask.sum() == 0:
+                for th in thresholds:
+                    stats[f'recall_{cls_name}_{th}'].append(0.0)
+                continue
 
-    # cx, cy, w, h を結合 (cyだけ差し替え)
-    loss_bbox = torch.stack([
-        loss_bbox_base[:, 0],  # cx
-        loss_cy,               # cy (非対称)
-        loss_bbox_base[:, 2],  # w
-        loss_bbox_base[:, 3],  # h
-    ], dim=1)
+            best_idx   = pred_scores[cls_mask].argmax()
+            pred_cy_px = (pred_boxes[cls_mask][best_idx][[1, 3]].sum() / 2)
 
-    losses = {}
-    losses['loss_bbox'] = loss_bbox.sum() / num_boxes
+            # GT - pred に修正
+            delta = gt_cy_px - pred_cy_px
 
-    loss_giou = 1 - torch.diag(box_ops.generalized_box_iou(
-        box_ops.box_cxcywh_to_xyxy(src_boxes),
-        box_ops.box_cxcywh_to_xyxy(target_boxes)))
-    losses['loss_giou'] = loss_giou.sum() / num_boxes
-    return losses
+            for th in thresholds:
+                if symmetric:
+                    tp = (-th <= delta <= th)
+                else:
+                    if gt_label == 0:  # 上端: δ∈[-th, 0] がTP
+                        tp = (-th <= delta <= 0)
+                    else:              # 下端: δ∈[0, th] がTP
+                        tp = (0 <= delta <= th)
+                stats[f'recall_{cls_name}_{th}'].append(float(tp))
+
+    result = {k: float(np.mean(v)) if v else 0.0 for k, v in stats.items()}
+    result['recall_mean'] = float(np.mean([
+        result[f'recall_{cls}_{th}']
+        for cls in ['top', 'bot']
+        for th in thresholds
+    ]))
+    return result
 
 
 
-## Matcherは任意
-
-def __init__(self, cost_class=1, cost_bbox=1, cost_giou=1, 
-             focal_alpha=0.25,
-             asymmetric_alpha=3.0):  # 追加
+def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, args=None):
+    model.eval()
     ...
-    self.asymmetric_alpha = asymmetric_alpha
+    # 既存の評価ループ
+    all_outputs = []
+    all_targets = []
 
-@torch.no_grad()
-def forward(self, outputs, targets, group_detr=1):
-    ...
-    # 既存コード
-    out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [N, 4]
-    tgt_bbox = torch.cat([v["boxes"] for v in targets])  # [M, 4]
-    tgt_ids  = torch.cat([v["labels"] for v in targets])  # [M]
+    for samples, targets in metric_logger.log_every(data_loader, 10, header):
+        samples = samples.to(device)
+        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+        if args.fp16_eval:
+            samples.tensors = samples.tensors.half()
 
-    # cx, w, h は従来通りの対称L1
-    # cy のみ非対称L1に変更
+        outputs = model(samples)
+
+        # 既存のcoco_evaluator処理
+        ...
+
+        # カスタム評価用に収集
+        all_outputs.append(outputs)
+        all_targets.extend(targets)
+
+    # カスタムRecall計算
+    # outputs を結合
+    combined_outputs = {
+        'pred_logits': torch.cat([o['pred_logits'] for o in all_outputs], dim=0),
+        'pred_boxes':  torch.cat([o['pred_boxes']  for o in all_outputs], dim=0),
+    }
+    cy_stats = compute_cy_recall(combined_outputs, all_targets, postprocessors)
     
-    # cx, w, h の L1コスト: [N, M]
-    cost_bbox_cxwh = (
-        torch.cdist(out_bbox[:, [0]], tgt_bbox[:, [0]], p=1) +  # cx
-        torch.cdist(out_bbox[:, [2]], tgt_bbox[:, [2]], p=1) +  # w
-        torch.cdist(out_bbox[:, [3]], tgt_bbox[:, [3]], p=1)    # h
-    )
+    # test_statsに追加
+    test_stats.update({f'cy_{k}': v for k, v in cy_stats.items()})
 
-    # cy の非対称L1コスト: [N, M]
-    delta_cy = out_bbox[:, 1:2] - tgt_bbox[:, 1:2].T  # [N, M]
+    return test_stats, coco_evaluator
 
-    alpha_asym = self.asymmetric_alpha
-    is_top = (tgt_ids == 0).unsqueeze(0)  # [1, M]
-    is_bot = (tgt_ids == 1).unsqueeze(0)  # [1, M]
+test_stats, coco_evaluator = evaluate(
+    model, criterion, postprocessors, data_loader_val, base_ds, device, args=args
+)
 
-    # 上端: δ<0 に厳しいペナルティ
-    cost_cy_top = torch.where(delta_cy < 0,
-        alpha_asym * delta_cy.abs(),
-        delta_cy.abs()
-    )
-    # 下端: δ>0 に厳しいペナルティ
-    cost_cy_bot = torch.where(delta_cy > 0,
-        alpha_asym * delta_cy.abs(),
-        delta_cy.abs()
-    )
-    # 通常L1 (フォールバック)
-    cost_cy_sym = delta_cy.abs()
+# 従来のGIoUベースmAP
+map_regular = test_stats['coco_eval_bbox'][0]
 
-    cost_cy = torch.where(is_top, cost_cy_top,
-              torch.where(is_bot, cost_cy_bot,
-              cost_cy_sym))
+# 新: cy誤差ベースRecall (高いほど良い)
+cy_recall = test_stats['cy_recall_mean']
 
-    cost_bbox = cost_bbox_cxwh + cost_cy
+# best model更新をcy_recallベースに変更
+_isbest = best_map_holder.update(cy_recall, epoch, is_ema=False)
 
-    # Final cost matrix (以降は変更なし)
-    C = self.cost_bbox * cost_bbox + self.cost_class * cost_class + self.cost_giou * cost_giou
+# ログ出力
+print(f"mAP: {map_regular:.4f} | cy_recall_mean: {cy_recall:.4f}")
+print(f"  top  7px: {test_stats['cy_recall_top_7']:.4f}  "
+      f" bot  7px: {test_stats['cy_recall_bot_7']:.4f}")
+print(f"  top 15px: {test_stats['cy_recall_top_15']:.4f}  "
+      f" bot 15px: {test_stats['cy_recall_bot_15']:.4f}")
+print(f"  top 25px: {test_stats['cy_recall_top_25']:.4f}  "
+      f" bot 25px: {test_stats['cy_recall_bot_25']:.4f}")
