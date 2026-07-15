@@ -67,7 +67,7 @@ class LandmarkSquareCrop(object):
     """
 
     CATEGORY_MAP = {"top": 1, "bottom": 2}
-
+    
     def __init__(self, crop_size=256, max_offset=64, target_type="top"):
         assert target_type in self.CATEGORY_MAP, \
             f"target_type must be 'top' or 'bottom', got {target_type}"
@@ -77,7 +77,14 @@ class LandmarkSquareCrop(object):
         self.category_id = self.CATEGORY_MAP[target_type]
 
     def _filter_target_category(self, target):
-        """対象カテゴリのbboxのみを残したtargetのコピーを返す"""
+        """
+        対象カテゴリのbboxのみを残す。
+        label_id=0は背景(no object)を表す規約のため、
+        前景クラスは1始まり。単一前景クラスとして学習するにあたり、
+        - top (category_id=1) はそのままlabel_id=1
+        - bottom (category_id=2) はlabel_id=1にリマップ
+        する。
+        """
         labels = target["labels"]
         keep = (labels == self.category_id)
 
@@ -86,6 +93,13 @@ class LandmarkSquareCrop(object):
         for field in fields:
             if field in filtered:
                 filtered[field] = filtered[field][keep]
+
+        if self.target_type == "bottom":
+            # category_id=2 -> label_id=1 にリマップ
+            filtered["labels"] = torch.ones_like(filtered["labels"])
+        # target_type == "top" の場合は category_id=1 がそのまま
+        # label_id=1 として使えるためリマップ不要
+
         return filtered
 
     def _get_basis_line_y(self, target):
