@@ -1,116 +1,77 @@
-# Step 1
-# From
-seed = args.seed + utils.get_rank()
-torch.manual_seed(seed)
-np.random.seed(seed)
-random.seed(seed)
+# 指示
+提供したLW-DETRのレポジトリを基に、モデルレベルのMixture of Experts (MoE) を実装したラッパークラス `DynamicModelMoE` をPyTorchで作成してください。検体容器の境界検出タスクを想定しており、推論時の高速化とロバスト性の両立が目的です。
 
-# To
-seed = args.seed + utils.get_rank()
-torch.manual_seed(seed)
-torch.cuda.manual_seed_all(seed)          # マルチGPU全てにseedを反映
-np.random.seed(seed)
-random.seed(seed)
+# 要件
+1. **ルーター構造**: 
+   - 入力画像を受け取る軽量なCNNルーター（ResNet18の最初の数層、またはカスタムの軽量MobileNetV3ベース）を実装してください。
+   - 出力次元は `num_experts` とし、各Expertへのロジットを出力します。
 
-torch.backends.cudnn.benchmark = False     # 入力サイズごとのアルゴリズム自動選択を止める
-torch.backends.cudnn.deterministic = True  # cuDNNの決定的アルゴリズムを強制
+2. **Gumbel-SoftmaxとSTE**:
+   - `F.gumbel_softmax(logits, tau, hard=True)` を使用してOne-hotなマスクを取得してください。
 
-os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')  # cuBLAS(行列積)の決定性確保
-torch.use_deterministic_algorithms(True, warn_only=True)
+3. **バッチ処理と勾配接続（最重要）**:
+   - バッチサイズが2以上の場合、全てのExpertに全バッチを入力するのは非効率です。
+   - One-hotマスクを元に、バッチ内のデータを各Expertへ振り分け（インデックスによるスライス）、それぞれのExpertの順伝播を実行後、元のバッチ順序に再結合（scatter/結合）してください。
+   - 再結合した出力テンソルに対して、Gumbel-Softmaxの出力マスクの対応する値を掛け合わせる (`out * y`) ことで、ルーターへ正しく勾配が逆流する計算グラフを構築してください。
 
-# Step 2
-# main.py のどこか(main関数の外)に追加
-def seed_worker(worker_id):
-    worker_seed = torch.initial_seed() % 2**32
-    np.random.seed(worker_seed)
-    random.seed(worker_seed)
+4. **推論モード (eval) の最適化**:
+   - `self.training == False` の場合はGumbel-Softmaxを使用せず、`argmax` を用いてバッチ内の各画像にTop-1のExpertのみを適用する効率的な条件分岐を実装してください。
 
-# main()内、seed設定後に追加
-g = torch.Generator()
-g.manual_seed(seed)
+5. **Load Balancing Loss**:
+   - ルーターのロジット（Softmax適用後）と実際の選択頻度から、特定のExpertへの極端な偏りを防ぐ `Load Balancing Loss` を計算し、フォワードパスの戻り値（またはクラスのプロパティ）として返せるようにしてください。
 
-# From
-data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
-                               collate_fn=utils.collate_fn, num_workers=args.num_workers)
-data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
-                             drop_last=False, collate_fn=utils.collate_fn, 
-                             num_workers=args.num_workers)
+# 構成例
+```python
+class DynamicModelMoE(nn.Module):
+    def __init__(self, experts: List[nn.Module], num_classes: int):
+        super().__init__()
+        self.experts = nn.ModuleList(experts)
+        self.router = # 軽量CNNの実装
+        self.tau = 1.0 # アニーリング対応可能に
 
-# To
-# 修正後
-data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
-                               collate_fn=utils.collate_fn, num_workers=args.num_workers,
-                               worker_init_fn=seed_worker, generator=g)
-data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
-                             drop_last=False, collate_fn=utils.collate_fn, 
-                             num_workers=args.num_workers,
-                             worker_init_fn=seed_worker, generator=g)
+    def forward(self, images, targets=None):
+        # 実装をお願いします
 
 
+################################PART2################################
+# 指示
+提供したLW-DETRのコードを基に、解像度が異なる2つのExpertモデルを動的にルーティングするMoEラッパークラス `MultiResDynamicMoE` をPyTorchで実装してください。
 
+# 前提条件
+- 対象タスク: 検体容器内の血清と分離剤の境界検出（バウンディングボックス出力、座標は0-1で正規化済）。
+- 入力データ: 原画像 `images` (256x1536)。
 
+# 要件
+1. **Expertの構成**:
+   - `expert_A`: 低解像度 (128x768) で動作する標準LW-DETR。
+   - `expert_B`: 高解像度 (256x1536) で動作するパッチ枝刈り導入版LW-DETR（別途実装済みのクラスをインスタンス化して渡す想定）。
+   
+2. **ルーター構造**:
+   - 128x768の画像を受け取り、2クラスのロジットを出力する軽量なCNN。
 
+3. **解像度の動的生成と順伝播**:
+   - `forward(images)` メソッド内で、まず `images` (256x1536) に対して `F.interpolate` を用いて低解像度画像 `images_low` (128x768) を生成してください。
+   - ルーターには `images_low` を入力し、Gumbel-Softmax (hard=True) で選択マスク `y` を取得します。
+   - 【学習時】: 勾配を流すため、バッチ内の各画像をインデックスで振り分けます。
+     - `expert_A` が選ばれたサンプルには `images_low` の該当スライスを入力。
+     - `expert_B` が選ばれたサンプルには `images` の該当スライスを入力。
+     - 双方の出力を元のバッチ順に結合し、出力に `y` を掛け合わせる（`out * y`）ことでルーターに勾配を接続してください。
+   - 【推論時 (eval)】: `argmax` を用いて1つのExpertだけを動かします。選ばれたExpertに合わせて `images_low` または `images` のどちらか一方だけを渡して推論を実行してください。
 
+4. **Load Balancing Loss**:
+   - ルーターのロジット出力から Load Balancing Loss を計算し、タスクのLossに加算できるようプロパティまたは戻り値として返してください。
 
-
-LW-DETR のViTエンコーダに「パッチ枝刈り機能」を追加実装してください。
-仕様は添付の `LW-DETR_patch_pruning_spec.md` を正としてください。実装対象は主に以下です。
-
-1. ViT backbone 側:
-   - **window attention を全廃**し、全6ブロックを global attention に統一する
-     （既存の window partition / reverse コードは削除、または dead code とせず
-     完全に経路から外すこと）。
-   - Patch Importance Scorer（Linear+Sigmoid、config で Conv2d+Sigmoid にも切替可能）を、
-     `prune_block_indices`（デフォルト `[1, 3, 5]`）で指定されたブロックの**直前**に挿入する。
-   - top-k によるハード選択で、各ステージ固定の keep_rate（デフォルト各0.5、累積
-     1→1/2→1/4→1/8）分のトークンのみ残す（gather）。
-   - 元のH0×W0グリッド上でのflat index（orig_pos_idx）を、pruning適用ごとに一貫して
-     引き継ぎ、かつ**各ステージ後に昇順ソート**して次段へ渡す実装にする（3.2節参照）。
-   - Block2, Block4, Block6 の出力をそれぞれ `feat_2`, `feat_4`, `feat_6` としてキャッシュする。
-   - Block6直前の pruning stage で得られた `idx_final` を基準に、`torch.searchsorted` を用いて
-     `feat_2`, `feat_4` から `idx_final` に対応する部分のみを抽出する（3.2節参照）。
-     このとき `idx_final ⊂ idx_4 ⊂ idx_2` のネスト構造が保証されていることを前提としてよいが、
-     念のためユニットテストで検証すること（5節の受け入れ基準3参照）。
-   - `feat_2_sub`, `feat_4_sub`, `feat_6` の3系統それぞれについて、専用の学習可能パラメータ
-     `mask_token_2` / `mask_token_4` / `mask_token_6`（config で共有にも切替可能）を用いて
-     フル解像度 `(bs, N0, C)` へ scatter-back する（3.4節参照）。
-   - 3系統をチャネル方向に concat → `(bs, N0, 3C)` → `(bs, 3C, H0, W0)` に reshape し、
-     既存の C2f モジュールへそのまま入力する。C2f 以降（multi-scale pyramid 生成、
-     `Transformer.forward` への `srcs`/`pos_embeds` 受け渡し、`transformer.py` 内のロジック）は
-     完全に無改修とする。
-   - `use_patch_pruning=False` のときは既存の forward（window attention含む旧経路）と
-     完全に数値等価になること（回帰テストを書くこと）。
-
-2. 損失関数側:
-   - GT bbox（血清上端・下端の2 bbox）から、各pruningステージの解像度に対応する
-     patch grid 上のターゲットマップ（パッチと bbox が少しでも重なれば1、
-     それ以外0の二値、論理和で2bbox分をまとめる）を生成する関数を実装する。
-   - 各ステージのスコアラー出力（ロジット）と、その時点で現存するトークンの
-     `orig_pos_idx` を使ってgatherしたターゲットとの間で
-     `BCEWithLogitsLoss(pos_weight=...)` を計算する（config で focal loss にも
-     切替可能にする）。
-   - 既存の detection loss（criterion.py 等、SetCriterion 相当のクラス）に
-     `loss_prune` として統合し、`lambda_prune` で重み付けして合算する。
-
-3. 学習まわり:
-   - keep_rate のカリキュラムスケジューリング（epoch経過で1.0から目標値へ線形/コサイン
-     で低下）をオプション実装する。config で on/off。
-   - 各pruningステージのスコアマップを可視化するデバッグ用ユーティリティ
-     （画像上に保持/削除パッチをオーバーレイ表示）を用意する。
-
-4. テスト:
-   - orig_pos_idx の gather → scatter が可逆であることを確認するユニットテスト
-     （ダミーデータでpositionをそのまま特徴量に埋め込み、scatter後に復元されるか）。
-   - use_patch_pruning=False 時の既存モデル（window attention含む旧経路）との出力一致テスト。
-   - 各pruning stage後のトークン数が `N0*1/2 → N0*1/4 → N0*1/8` の期待通りであることの
-     shapeテスト。
-   - `idx_final ⊂ idx_4 ⊂ idx_2` のネスト構造が常に成立することを確認するテスト。
-   - `torch.searchsorted` による feat_2/feat_4 からの抽出が正しい特徴を取得できているかの
-     一致検証テスト。
-   - `full_2`, `full_4`, `full_6` の scatter 結果について、`idx_final` に該当する位置は
-     実特徴、それ以外は対応する mask_token と完全一致していることを確認するテスト。
-
-既存コード（backbone, transformer.py, criterion.py 等）の該当ファイルをまず提示するので、
-それを踏まえて具体的な差分（新規ファイル/既存ファイルへのパッチ）として実装してください。
-仕様書中の Config パラメータ一覧に沿って、すべてハイパーパラメータとして外出しできる
-ようにしてください。
+# 構成例
+```python
+class MultiResDynamicMoE(nn.Module):
+    def __init__(self, expert_A: nn.Module, expert_B: nn.Module):
+        super().__init__()
+        self.expert_A = expert_A
+        self.expert_B = expert_B
+        self.router = # 軽量CNN
+        
+    def forward(self, images, targets=None):
+        # 1. 画像のダウンサンプル (images -> images_low)
+        # 2. ルーターによるロジット計算 (入力は images_low)
+        # 3. ルーティング処理 (学習時: 両方計算して勾配接続, 推論時: Top-1のみ計算)
+        # 実装をお願いします
